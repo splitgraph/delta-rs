@@ -74,12 +74,12 @@ reqwest-retry = { version = "0.2.2", optional = true }
 
 # Datafusion
 dashmap = { version = "5", optional = true }
-datafusion = { version = "26", optional = true }
-datafusion-expr = { version = "26", optional = true }
-datafusion-common = { version = "26", optional = true }
-datafusion-proto = { version = "26", optional = true }
-datafusion-sql = { version = "26", optional = true }
-datafusion-physical-expr = { version = "26", optional = true }
+datafusion = { git = "https://github.com/apache/arrow-datafusion", rev = "70d633a71d0096b03bd8f173b000fdca82671d3f", optional = true }
+datafusion-expr = { git = "https://github.com/apache/arrow-datafusion", rev = "70d633a71d0096b03bd8f173b000fdca82671d3f", optional = true }
+datafusion-common = { git = "https://github.com/apache/arrow-datafusion", rev = "70d633a71d0096b03bd8f173b000fdca82671d3f", optional = true }
+datafusion-proto = { git = "https://github.com/apache/arrow-datafusion", rev = "70d633a71d0096b03bd8f173b000fdca82671d3f", optional = true }
+datafusion-sql = { git = "https://github.com/apache/arrow-datafusion", rev = "70d633a71d0096b03bd8f173b000fdca82671d3f", optional = true }
+datafusion-physical-expr = { git = "https://github.com/apache/arrow-datafusion", rev = "70d633a71d0096b03bd8f173b000fdca82671d3f", optional = true }
 
 
 sqlparser = { version = "0.34", optional = true }
