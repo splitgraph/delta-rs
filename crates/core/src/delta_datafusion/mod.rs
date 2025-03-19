@@ -1122,7 +1122,6 @@ pub(crate) fn get_null_of_arrow_type(t: &ArrowDataType) -> DeltaResult<ScalarVal
         | ArrowDataType::Interval(_)
         | ArrowDataType::RunEndEncoded(_, _)
         | ArrowDataType::BinaryView
-        | ArrowDataType::Utf8View
         | ArrowDataType::LargeListView(_)
         | ArrowDataType::ListView(_)
         | ArrowDataType::Map(_, _) => Err(DeltaTableError::Generic(format!(
