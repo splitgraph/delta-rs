@@ -208,6 +208,7 @@ fn _arrow_schema(snapshot: &Snapshot, wrap_partitions: bool) -> DeltaResult<Arro
                         // Only dictionary-encode types that may be large
                         // // https://github.com/apache/arrow-datafusion/pull/5545
                         ArrowDataType::Utf8
+                        | ArrowDataType::Utf8View
                         | ArrowDataType::LargeUtf8
                         | ArrowDataType::Binary
                         | ArrowDataType::LargeBinary => {
@@ -953,6 +954,7 @@ pub(crate) fn get_null_of_arrow_type(t: &ArrowDataType) -> DeltaResult<ScalarVal
         }
         ArrowDataType::LargeBinary => Ok(ScalarValue::LargeBinary(None)),
         ArrowDataType::Utf8 => Ok(ScalarValue::Utf8(None)),
+        ArrowDataType::Utf8View => Ok(ScalarValue::Utf8View(None)),
         ArrowDataType::LargeUtf8 => Ok(ScalarValue::LargeUtf8(None)),
         ArrowDataType::Decimal128(precision, scale) => Ok(ScalarValue::Decimal128(
             None,

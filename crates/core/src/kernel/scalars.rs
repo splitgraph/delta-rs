@@ -97,7 +97,7 @@ impl ScalarExt for Scalar {
         }
 
         match arr.data_type() {
-            Utf8 => arr
+            Utf8 | Utf8View => arr
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .map(|v| Self::String(v.value(index).to_string())),

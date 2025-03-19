@@ -395,7 +395,7 @@ impl<'a> fmt::Display for ScalarValueFormat<'a> {
                 },
                 None => write!(f, "NULL")?,
             },
-            ScalarValue::Utf8(e) | ScalarValue::LargeUtf8(e) => match e {
+            ScalarValue::Utf8(e) | ScalarValue::Utf8View(e) | ScalarValue::LargeUtf8(e) => match e {
                 Some(e) => write!(f, "'{}'", escape_quoted_string(e, '\''))?,
                 None => write!(f, "NULL")?,
             },
