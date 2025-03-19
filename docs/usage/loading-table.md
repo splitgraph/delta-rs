@@ -16,10 +16,20 @@ options](https://docs.rs/object_store/latest/object_store/azure/enum.AzureConfig
 [gcs
 options](https://docs.rs/object_store/latest/object_store/gcp/enum.GoogleConfigKey.html#variants).
 
-```python
->>> storage_options = {"AWS_ACCESS_KEY_ID": "THE_AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY":"THE_AWS_SECRET_ACCESS_KEY"}
->>> dt = DeltaTable("../rust/tests/data/delta-0.2.0", storage_options=storage_options)
-```
+=== "Python"
+    ```python
+    >>> storage_options = {"AWS_ACCESS_KEY_ID": "THE_AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY":"THE_AWS_SECRET_ACCESS_KEY"}
+    >>> dt = DeltaTable("../rust/tests/data/delta-0.2.0", storage_options=storage_options)
+    ```
+
+=== "Rust"
+    ```rust
+    let storage_options = HashMap::from_iter(vec![
+        ("AWS_ACCESS_KEY_ID".to_string(), "THE_AWS_ACCESS_KEY_ID".to_string()),
+        ("AWS_SECRET_ACCESS_KEY".to_string(), "THE_AWS_SECRET_ACCESS_KEY".to_string()),
+    ]);
+    let table = open_table_with_storage_options("../rust/tests/data/delta-0.2.0", storage_options).await?;
+    ```
 
 The configuration can also be provided via the environment, and the
 basic service provider is derived from the URL being used. We try to
@@ -43,47 +53,57 @@ Note that `delta-rs` does not read credentials from a local `.aws/config` or `.a
 
 > - gs://\<bucket\>/\<path\>
 
-Alternatively, if you have a data catalog you can load it by reference
-to a database and table name. Currently only AWS Glue is supported.
-
-For AWS Glue catalog, use AWS environment variables to authenticate.
-
-```python
->>> from deltalake import DeltaTable
->>> from deltalake import DataCatalog
->>> database_name = "simple_database"
->>> table_name = "simple_table"
->>> data_catalog = DataCatalog.AWS
->>> dt = DeltaTable.from_data_catalog(data_catalog=data_catalog, database_name=database_name, table_name=table_name)
->>> dt.to_pyarrow_table().to_pydict()
-{'id': [5, 7, 9, 5, 6, 7, 8, 9]}
-```
 
 ## Verify Table Existence
 
 You can check whether or not a Delta table exists at a particular path by using
 the `DeltaTable.is_deltatable()` method.
 
-```python
-from deltalake import DeltaTable
+=== "Python"
 
-table_path = "<path/to/valid/table>"
-DeltaTable.is_deltatable(table_path)
-# True
+    ```python
+    from deltalake import DeltaTable
 
-invalid_table_path = "<path/to/nonexistent/table>"
-DeltaTable.is_deltatable(invalid_table_path)
-# False
+    table_path = "<path/to/valid/table>"
+    DeltaTable.is_deltatable(table_path)
+    # True
 
-bucket_table_path = "<path/to/valid/table/in/bucket>"
-storage_options = {
-    "AWS_ACCESS_KEY_ID": "THE_AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY": "THE_AWS_SECRET_ACCESS_KEY",
-    ...
-}
-DeltaTable.is_deltatable(bucket_table_path)
-# True
-```
+    invalid_table_path = "<path/to/nonexistent/table>"
+    DeltaTable.is_deltatable(invalid_table_path)
+    # False
+
+    bucket_table_path = "<path/to/valid/table/in/bucket>"
+    storage_options = {
+        "AWS_ACCESS_KEY_ID": "THE_AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY": "THE_AWS_SECRET_ACCESS_KEY",
+        ...
+    }
+    DeltaTable.is_deltatable(bucket_table_path, storage_options)
+    # True
+    ```
+
+=== "Rust"
+
+    ```rust
+    let table_path = "<path/to/valid/table>";
+    let builder = deltalake::DeltaTableBuilder::from_uri(table_path);
+    builder.build()?.verify_deltatable_existence().await?;
+    // true
+
+    let invalid_table_path = "<path/to/nonexistent/table>";
+    let builder = deltalake::DeltaTableBuilder::from_uri(invalid_table_path);
+    builder.build()?.verify_deltatable_existence().await?;
+    // false
+
+    let bucket_table_path = "<path/to/valid/table/in/bucket>";
+    let storage_options = HashMap::from_iter(vec![
+        ("AWS_ACCESS_KEY_ID".to_string(), "THE_AWS_ACCESS_KEY_ID".to_string()),
+        ("AWS_SECRET_ACCESS_KEY".to_string(), "THE_AWS_SECRET_ACCESS_KEY".to_string()),
+    ]);
+    let builder = deltalake::DeltaTableBuilder::from_uri(bucket_table_path).with_storage_options(storage_options);
+    builder.build()?.verify_deltatable_existence().await?;
+    // true
+    ```
 
 
 ## Custom Storage Backends
@@ -127,20 +147,69 @@ ds = dt.to_pyarrow_dataset(filesystem=filesystem)
 To load previous table states, you can provide the version number you
 wish to load:
 
-```python
->>> dt = DeltaTable("../rust/tests/data/simple_table", version=2)
-```
+=== "Python"
+    ```python
+    >>> dt = DeltaTable("../rust/tests/data/simple_table", version=2)
+    ```
+=== "Rust"
+    ```rust
+    let mut table = open_table("./data/simple_table").await?;
+    table.load_version(1).await?;
+    ```
 
-Once you\'ve loaded a table, you can also change versions using either a
+
+Once you've loaded a table, you can also change versions using either a
 version number or datetime string:
 
-```python
->>> dt.load_version(1)
->>> dt.load_with_datetime("2021-11-04 00:05:23.283+00:00")
-```
-
+=== "Python"
+    ```python
+    >>> dt.load_version(1)
+    >>> dt.load_with_datetime("2021-11-04 00:05:23.283+00:00")
+    ```
+=== "Rust"
+    ```rust
+    table.load_version(1).await?;
+    table.load_with_datetime("2021-11-04 00:05:23.283+00:00".parse().unwrap()).await?;
+    ```
 !!! warning
 
     Previous table versions may not exist if they have been vacuumed, in
     which case an exception will be thrown. See [Vacuuming
     tables](managing-tables.md#vacuuming-tables) for more information.
+
+## Load table from Unity Catalog
+
+You may load a Delta Table from your Databricks or Open Source Unity Catalog using a `uc://` URL of format `uc://<catalog-name>.<db-name>.<table-name>`. Example as follows:
+
+=== "Python"
+
+    ```python
+    import os
+    from deltalake import DeltaTable
+
+    # Set your Unity Catalog workspace URL in the
+    # DATABRICKS_WORKSPACE_URL environment variable.
+    os.environ["DATABRICKS_WORKSPACE_URL"] = "https://adb-1234567890.XX.azuredatabricks.net"
+
+    # Set your Unity Catalog access token in the
+    # DATABRICKS_ACCESS_TOKEN environment variable.
+    os.environ["DATABRICKS_ACCESS_TOKEN"] = "<unity-catalog-access-token-here>"
+
+    # Your Unity Catalog name here
+    catalog_name = "unity"
+
+    # Your UC database name here
+    db_name = "my_database"
+
+    # Your table name in the UC database here
+    table_name = "my_table"
+
+    # Full UC URL in required format
+    uc_full_url = f"{catalog_name}.{db_name}.{table_name}"
+
+    # This should load the valid delta table at specified location,
+    # and you can start using it.
+    dt = DeltaTable(uc_full_url)
+    dt.is_deltatable(dt.table_uri)
+    # True
+    ```

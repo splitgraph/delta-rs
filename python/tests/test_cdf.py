@@ -5,8 +5,18 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
+import pytest
 
 from deltalake import DeltaTable, write_deltalake
+from deltalake.exceptions import DeltaError
+
+
+def test_read_cdf_partitioned_with_predicate():
+    dt = DeltaTable("../crates/test/tests/data/cdf-table/")
+    data = dt.load_cdf(0, 3, predicate="birthday = '2023-12-25'").read_all().to_pydict()
+    values = list(set(data["birthday"]))
+    assert len(values) == 1
+    assert values[0] == date(2023, 12, 25)
 
 
 def test_read_cdf_partitioned():
@@ -500,7 +510,6 @@ def test_write_predicate_unpartitioned_cdf(tmp_path, sample_data: pa.Table):
         data=ds.dataset(sample_data).to_table(filter=(pc.field("int64") > 2)),
         mode="overwrite",
         predicate="int64 > 2",
-        engine="rust",
         configuration={"delta.enableChangeDataFeed": "true"},
     )
 
@@ -545,7 +554,6 @@ def test_write_predicate_partitioned_cdf(tmp_path, sample_data: pa.Table):
         data=ds.dataset(sample_data).to_table(filter=(pc.field("int64") > 3)),
         mode="overwrite",
         predicate="int64 > 3",
-        engine="rust",
         configuration={"delta.enableChangeDataFeed": "true"},
     )
 
@@ -598,7 +606,6 @@ def test_write_overwrite_unpartitioned_cdf(tmp_path, sample_data: pa.Table):
         dt,
         data=ds.dataset(sample_data).to_table(),
         mode="overwrite",
-        engine="rust",
         configuration={"delta.enableChangeDataFeed": "true"},
     )
     sort_values = [("_change_type", "ascending"), ("utf8", "ascending")]
@@ -644,7 +651,6 @@ def test_write_overwrite_partitioned_cdf(tmp_path, sample_data: pa.Table):
     write_deltalake(
         dt,
         data=batch2,
-        engine="rust",
         mode="overwrite",
         predicate="int64 > 3",
         partition_by=["int64"],
@@ -677,3 +683,72 @@ def test_write_overwrite_partitioned_cdf(tmp_path, sample_data: pa.Table):
     ).sort_by(sort_values).select(expected_data.column_names) == pa.concat_tables(
         [first_batch, expected_data]
     ).sort_by(sort_values)
+
+
+def test_read_cdf_version_out_of_range():
+    dt = DeltaTable("../crates/test/tests/data/cdf-table/")
+
+    with pytest.raises(DeltaError) as e:
+        dt.load_cdf(4).read_all().to_pydict()
+
+    assert (
+        "invalid version. start version 4 is greater than end version 3"
+        in str(e).lower()
+    )
+
+
+def test_read_cdf_version_out_of_range_with_flag():
+    dt = DeltaTable("../crates/test/tests/data/cdf-table/")
+    b = dt.load_cdf(4, allow_out_of_range=True).read_all()
+
+    assert len(b) == 0
+
+
+def test_read_timestamp_cdf_out_of_range():
+    dt = DeltaTable("../crates/test/tests/data/cdf-table/")
+    start = "2033-12-22T17:10:21.675Z"
+
+    with pytest.raises(DeltaError) as e:
+        dt.load_cdf(starting_timestamp=start).read_all().to_pydict()
+
+    assert "is greater than latest commit timestamp" in str(e).lower()
+
+
+def test_read_timestamp_cdf_out_of_range_with_flag():
+    dt = DeltaTable("../crates/test/tests/data/cdf-table/")
+
+    start = "2033-12-22T17:10:21.675Z"
+    b = dt.load_cdf(starting_timestamp=start, allow_out_of_range=True).read_all()
+
+    assert len(b) == 0
+
+
+def test_read_cdf_last_version(tmp_path):
+    data = pa.Table.from_pydict({"foo": [1, 2, 3]})
+
+    expected = pa.Table.from_pydict(
+        {
+            "foo": [1, 2, 3],
+            "_change_type": ["insert", "insert", "insert"],
+            "_commit_version": [0, 0, 0],
+        }
+    )
+
+    write_deltalake(
+        tmp_path,
+        data=data,
+        configuration={"delta.enableChangeDataFeed": "true"},
+    )
+
+    data = (
+        DeltaTable(tmp_path)
+        .load_cdf(
+            starting_version=0,
+            ending_version=0,
+            allow_out_of_range=False,
+            columns=["foo", "_change_type", "_commit_version"],
+        )
+        .read_all()
+    )
+
+    assert expected == data

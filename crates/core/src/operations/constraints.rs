@@ -14,16 +14,18 @@ use crate::delta_datafusion::expr::fmt_expr_to_sql;
 use crate::delta_datafusion::{
     register_store, DeltaDataChecker, DeltaScanBuilder, DeltaSessionContext,
 };
-use crate::kernel::{Protocol, WriterFeatures};
+use crate::kernel::Protocol;
 use crate::logstore::LogStoreRef;
 use crate::operations::datafusion_utils::Expression;
 use crate::protocol::DeltaOperation;
 use crate::table::state::DeltaTableState;
 use crate::table::Constraint;
 use crate::{DeltaResult, DeltaTable, DeltaTableError};
+use delta_kernel::table_features::WriterFeatures;
 
 use super::datafusion_utils::into_expr;
 use super::transaction::{CommitBuilder, CommitProperties};
+use super::{CustomExecuteHandler, Operation};
 
 /// Build a constraint to add to a table
 pub struct ConstraintBuilder {
@@ -39,9 +41,17 @@ pub struct ConstraintBuilder {
     state: Option<SessionState>,
     /// Additional information to add to the commit
     commit_properties: CommitProperties,
+    custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
 }
 
-impl super::Operation<()> for ConstraintBuilder {}
+impl super::Operation<()> for ConstraintBuilder {
+    fn log_store(&self) -> &LogStoreRef {
+        &self.log_store
+    }
+    fn get_custom_execute_handler(&self) -> Option<Arc<dyn CustomExecuteHandler>> {
+        self.custom_execute_handler.clone()
+    }
+}
 
 impl ConstraintBuilder {
     /// Create a new builder
@@ -53,6 +63,7 @@ impl ConstraintBuilder {
             log_store,
             state: None,
             commit_properties: CommitProperties::default(),
+            custom_execute_handler: None,
         }
     }
 
@@ -78,6 +89,12 @@ impl ConstraintBuilder {
         self.commit_properties = commit_properties;
         self
     }
+
+    /// Set a custom execute handler, for pre and post execution
+    pub fn with_custom_execute_handler(mut self, handler: Arc<dyn CustomExecuteHandler>) -> Self {
+        self.custom_execute_handler = Some(handler);
+        self
+    }
 }
 
 impl std::future::IntoFuture for ConstraintBuilder {
@@ -94,6 +111,8 @@ impl std::future::IntoFuture for ConstraintBuilder {
                     "ADD CONSTRAINTS".into(),
                 ));
             }
+            let operation_id = this.get_operation_id();
+            this.pre_execute(operation_id).await?;
 
             let name = match this.name {
                 Some(v) => v,
@@ -102,15 +121,14 @@ impl std::future::IntoFuture for ConstraintBuilder {
 
             let expr = this
                 .expr
-                .ok_or_else(|| DeltaTableError::Generic("No Expresion provided".to_string()))?;
+                .ok_or_else(|| DeltaTableError::Generic("No Expression provided".to_string()))?;
 
             let mut metadata = this.snapshot.metadata().clone();
-            let configuration_key = format!("delta.constraints.{}", name);
+            let configuration_key = format!("delta.constraints.{name}");
 
             if metadata.configuration.contains_key(&configuration_key) {
                 return Err(DeltaTableError::Generic(format!(
-                    "Constraint with name: {} already exists",
-                    name
+                    "Constraint with name: {name} already exists"
                 )));
             }
 
@@ -161,10 +179,9 @@ impl std::future::IntoFuture for ConstraintBuilder {
             // We have validated the table passes it's constraints, now to add the constraint to
             // the table.
 
-            metadata.configuration.insert(
-                format!("delta.constraints.{}", name),
-                Some(expr_str.clone()),
-            );
+            metadata
+                .configuration
+                .insert(format!("delta.constraints.{name}"), Some(expr_str.clone()));
 
             let old_protocol = this.snapshot.protocol();
             let protocol = Protocol {
@@ -201,8 +218,14 @@ impl std::future::IntoFuture for ConstraintBuilder {
 
             let commit = CommitBuilder::from(this.commit_properties)
                 .with_actions(actions)
+                .with_operation_id(operation_id)
+                .with_post_commit_hook_handler(this.custom_execute_handler.clone())
                 .build(Some(&this.snapshot), this.log_store.clone(), operation)
                 .await?;
+
+            if let Some(handler) = this.custom_execute_handler {
+                handler.post_execute(&this.log_store, operation_id).await?;
+            }
 
             Ok(DeltaTable::new_with_state(
                 this.log_store,
@@ -247,6 +270,32 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned()
+    }
+
+    #[tokio::test]
+    async fn test_get_constraints_with_correct_names() -> DeltaResult<()> {
+        // The key of a constraint is allowed to be custom
+        // https://github.com/delta-io/delta/blob/master/PROTOCOL.md#check-constraints
+        let batch = get_record_batch(None, false);
+        let write = DeltaOps(create_bare_table())
+            .write(vec![batch.clone()])
+            .await?;
+        let table = DeltaOps(write);
+
+        let constraint = table
+            .add_constraint()
+            .with_constraint("my_custom_constraint", "value < 100")
+            .await;
+        assert!(constraint.is_ok());
+        let constraints = constraint
+            .unwrap()
+            .state
+            .unwrap()
+            .table_config()
+            .get_constraints();
+        assert!(constraints.len() == 1);
+        assert_eq!(constraints[0].name, "my_custom_constraint");
+        Ok(())
     }
 
     #[tokio::test]

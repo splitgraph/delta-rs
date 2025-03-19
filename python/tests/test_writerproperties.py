@@ -28,14 +28,14 @@ def test_writer_properties_all_filled():
         column_properties={
             "a": ColumnProperties(
                 dictionary_enabled=True,
-                max_statistics_size=40,
+                statistics_enabled="CHUNK",
                 bloom_filter_properties=BloomFilterProperties(
                     set_bloom_filter_enabled=True, fpp=0.2, ndv=30
                 ),
             ),
             "b": ColumnProperties(
                 dictionary_enabled=True,
-                max_statistics_size=400,
+                statistics_enabled="PAGE",
                 bloom_filter_properties=BloomFilterProperties(
                     set_bloom_filter_enabled=False, fpp=0.2, ndv=30
                 ),
@@ -92,9 +92,7 @@ def test_invalid_fpp_value():
 def test_write_with_writerproperties(
     tmp_path: pathlib.Path, sample_table: pa.Table, writer_properties: WriterProperties
 ):
-    write_deltalake(
-        tmp_path, sample_table, engine="rust", writer_properties=writer_properties
-    )
+    write_deltalake(tmp_path, sample_table, writer_properties=writer_properties)
 
     parquet_path = DeltaTable(tmp_path).file_uris()[0]
     metadata = pq.read_metadata(parquet_path)

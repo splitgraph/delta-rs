@@ -14,6 +14,7 @@ use crate::kernel::Transaction;
 
 /// Allows hooking into the reading of commit files and checkpoints whenever a table is loaded or updated.
 pub trait ReplayVisitor: std::fmt::Debug + Send + Sync {
+    /// Return an [Any] type
     fn as_any(&self) -> &dyn std::any::Any;
 
     /// Process a batch
@@ -143,7 +144,7 @@ mod tests {
             Some(Some(123))
         );
 
-        // test that only the first encountered txn ist tacked for every app id.
+        // test that only the first encountered txn is tacked for every app id.
         data_app.extend([None, Some("my-app")]);
         data_version.extend([None, Some(2)]);
         data_last_updated.extend([None, Some(124)]);

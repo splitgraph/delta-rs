@@ -13,7 +13,7 @@ pub async fn setup_s3_context() -> TestContext {
     let cli = S3Cli::default();
     let endpoint = "http://localhost:4566".to_string();
     let bucket_name = "delta-rs-tests";
-    let uri = format!("s3://{}/{}/{}/", bucket_name, Utc::now().timestamp(), rand);
+    let uri = format!("s3://{bucket_name}/{}/{rand}/", Utc::now().timestamp());
     let lock_table = format!("delta_rs_lock_table_{rand}");
 
     let region = "us-east-1".to_string();
@@ -39,7 +39,10 @@ pub async fn setup_s3_context() -> TestContext {
     config.insert("AWS_ACCESS_KEY_ID".to_owned(), "deltalake".to_owned());
     config.insert("AWS_SECRET_ACCESS_KEY".to_owned(), "weloverust".to_owned());
     config.insert("AWS_S3_LOCKING_PROVIDER".to_owned(), "dynamodb".to_owned());
-    config.insert(constants::LOCK_TABLE_KEY_NAME.to_owned(), lock_table.clone());
+    config.insert(
+        constants::LOCK_TABLE_KEY_NAME.to_owned(),
+        lock_table.clone(),
+    );
     config.insert("AWS_ALLOW_HTTP".to_owned(), "TRUE".to_string());
 
     TestContext {
@@ -72,7 +75,7 @@ impl S3Cli {
         child.wait().unwrap();
     }
 
-    pub fn rm_recurive(&self, prefix: &str, endpoint: &str) {
+    pub fn rm_recursive(&self, prefix: &str, endpoint: &str) {
         let mut child = Command::new("aws")
             .args([
                 "s3",
@@ -140,7 +143,7 @@ struct S3 {
 impl Drop for S3 {
     fn drop(&mut self) {
         let cli = S3Cli::default();
-        cli.rm_recurive(&self.uri, &self.endpoint);
+        cli.rm_recursive(&self.uri, &self.endpoint);
         cli.delete_table(&self.lock_table, &self.endpoint);
     }
 }

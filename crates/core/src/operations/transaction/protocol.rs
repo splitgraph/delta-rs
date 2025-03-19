@@ -1,42 +1,44 @@
 use std::collections::HashSet;
-
-use lazy_static::lazy_static;
-use once_cell::sync::Lazy;
-use tracing::log::*;
+use std::sync::LazyLock;
 
 use super::{TableReference, TransactionError};
-use crate::kernel::{
-    Action, DataType, EagerSnapshot, ReaderFeatures, Schema, StructField, WriterFeatures,
-};
+use crate::kernel::{contains_timestampntz, Action, EagerSnapshot, Schema};
 use crate::protocol::DeltaOperation;
 use crate::table::state::DeltaTableState;
+use delta_kernel::table_features::{ReaderFeatures, WriterFeatures};
 
-lazy_static! {
-    static ref READER_V2: HashSet<ReaderFeatures> =
-        HashSet::from_iter([ReaderFeatures::ColumnMapping]);
-    static ref WRITER_V2: HashSet<WriterFeatures> =
-        HashSet::from_iter([WriterFeatures::AppendOnly, WriterFeatures::Invariants]);
-    static ref WRITER_V3: HashSet<WriterFeatures> = HashSet::from_iter([
+static READER_V2: LazyLock<HashSet<ReaderFeatures>> =
+    LazyLock::new(|| HashSet::from_iter([ReaderFeatures::ColumnMapping]));
+static WRITER_V2: LazyLock<HashSet<WriterFeatures>> =
+    LazyLock::new(|| HashSet::from_iter([WriterFeatures::AppendOnly, WriterFeatures::Invariants]));
+static WRITER_V3: LazyLock<HashSet<WriterFeatures>> = LazyLock::new(|| {
+    HashSet::from_iter([
         WriterFeatures::AppendOnly,
         WriterFeatures::Invariants,
-        WriterFeatures::CheckConstraints
-    ]);
-    static ref WRITER_V4: HashSet<WriterFeatures> = HashSet::from_iter([
+        WriterFeatures::CheckConstraints,
+    ])
+});
+static WRITER_V4: LazyLock<HashSet<WriterFeatures>> = LazyLock::new(|| {
+    HashSet::from_iter([
         WriterFeatures::AppendOnly,
         WriterFeatures::Invariants,
         WriterFeatures::CheckConstraints,
         WriterFeatures::ChangeDataFeed,
-        WriterFeatures::GeneratedColumns
-    ]);
-    static ref WRITER_V5: HashSet<WriterFeatures> = HashSet::from_iter([
+        WriterFeatures::GeneratedColumns,
+    ])
+});
+static WRITER_V5: LazyLock<HashSet<WriterFeatures>> = LazyLock::new(|| {
+    HashSet::from_iter([
         WriterFeatures::AppendOnly,
         WriterFeatures::Invariants,
         WriterFeatures::CheckConstraints,
         WriterFeatures::ChangeDataFeed,
         WriterFeatures::GeneratedColumns,
         WriterFeatures::ColumnMapping,
-    ]);
-    static ref WRITER_V6: HashSet<WriterFeatures> = HashSet::from_iter([
+    ])
+});
+static WRITER_V6: LazyLock<HashSet<WriterFeatures>> = LazyLock::new(|| {
+    HashSet::from_iter([
         WriterFeatures::AppendOnly,
         WriterFeatures::Invariants,
         WriterFeatures::CheckConstraints,
@@ -44,8 +46,8 @@ lazy_static! {
         WriterFeatures::GeneratedColumns,
         WriterFeatures::ColumnMapping,
         WriterFeatures::IdentityColumns,
-    ]);
-}
+    ])
+});
 
 pub struct ProtocolChecker {
     reader_features: HashSet<ReaderFeatures>,
@@ -80,29 +82,13 @@ impl ProtocolChecker {
         Ok(())
     }
 
-    /// checks if table contains timestamp_ntz in any field including nested fields.
-    pub fn contains_timestampntz<'a>(
-        &self,
-        mut fields: impl Iterator<Item = &'a StructField>,
-    ) -> bool {
-        fn _check_type(dtype: &DataType) -> bool {
-            match dtype {
-                &DataType::TIMESTAMP_NTZ => true,
-                DataType::Array(inner) => _check_type(inner.element_type()),
-                DataType::Struct(inner) => inner.fields().any(|f| _check_type(f.data_type())),
-                _ => false,
-            }
-        }
-        fields.any(|f| _check_type(f.data_type()))
-    }
-
     /// Check can write_timestamp_ntz
     pub fn check_can_write_timestamp_ntz(
         &self,
         snapshot: &DeltaTableState,
         schema: &Schema,
     ) -> Result<(), TransactionError> {
-        let contains_timestampntz = self.contains_timestampntz(schema.fields());
+        let contains_timestampntz = contains_timestampntz(schema.fields());
         let required_features: Option<&HashSet<WriterFeatures>> =
             match snapshot.protocol().min_writer_version {
                 0..=6 => None,
@@ -159,22 +145,6 @@ impl ProtocolChecker {
             6 => Some(&WRITER_V6),
             _ => snapshot.protocol().writer_features.as_ref(),
         };
-
-        if (4..7).contains(&min_writer_version) {
-            debug!("min_writer_version is less 4-6, checking for unsupported table features");
-            if let Ok(schema) = snapshot.metadata().schema() {
-                for field in schema.fields() {
-                    if field.metadata.contains_key(
-                        crate::kernel::ColumnMetadataKey::GenerationExpression.as_ref(),
-                    ) {
-                        error!("The table contains `delta.generationExpression` settings on columns which mean this table cannot be currently written to by delta-rs");
-                        return Err(TransactionError::UnsupportedWriterFeatures(vec![
-                            WriterFeatures::GeneratedColumns,
-                        ]));
-                    }
-                }
-            }
-        }
 
         if let Some(features) = required_features {
             let mut diff = features.difference(&self.writer_features).peekable();
@@ -236,7 +206,7 @@ impl ProtocolChecker {
 ///
 /// As we implement new features, we need to update this instance accordingly.
 /// resulting version support is determined by the supported table feature set.
-pub static INSTANCE: Lazy<ProtocolChecker> = Lazy::new(|| {
+pub static INSTANCE: LazyLock<ProtocolChecker> = LazyLock::new(|| {
     let mut reader_features = HashSet::new();
     reader_features.insert(ReaderFeatures::TimestampWithoutTimezone);
     // reader_features.insert(ReaderFeatures::ColumnMapping);
@@ -247,15 +217,13 @@ pub static INSTANCE: Lazy<ProtocolChecker> = Lazy::new(|| {
     #[cfg(feature = "cdf")]
     {
         writer_features.insert(WriterFeatures::ChangeDataFeed);
-        writer_features.insert(WriterFeatures::GeneratedColumns);
     }
     #[cfg(feature = "datafusion")]
     {
         writer_features.insert(WriterFeatures::Invariants);
         writer_features.insert(WriterFeatures::CheckConstraints);
+        writer_features.insert(WriterFeatures::GeneratedColumns);
     }
-    // writer_features.insert(WriterFeatures::ChangeDataFeed);
-    // writer_features.insert(WriterFeatures::GeneratedColumns);
     // writer_features.insert(WriterFeatures::ColumnMapping);
     // writer_features.insert(WriterFeatures::IdentityColumns);
 
@@ -585,8 +553,7 @@ mod tests {
         let checker_5 = ProtocolChecker::new(READER_V2.clone(), WRITER_V4.clone());
         let actions = vec![
             Action::Protocol(
-                Protocol::new(2, 4)
-                    .with_writer_features(vec![crate::kernel::WriterFeatures::ChangeDataFeed]),
+                Protocol::new(2, 4).append_writer_features(vec![WriterFeatures::ChangeDataFeed]),
             ),
             metadata_action(None).into(),
         ];
@@ -603,8 +570,7 @@ mod tests {
         let checker_5 = ProtocolChecker::new(READER_V2.clone(), WRITER_V4.clone());
         let actions = vec![
             Action::Protocol(
-                Protocol::new(2, 4)
-                    .with_writer_features(vec![crate::kernel::WriterFeatures::GeneratedColumns]),
+                Protocol::new(2, 4).append_writer_features([WriterFeatures::GeneratedColumns]),
             ),
             metadata_action(None).into(),
         ];
@@ -636,6 +602,6 @@ mod tests {
         let eager_5 = table
             .snapshot()
             .expect("Failed to get snapshot from test table");
-        assert!(checker_5.can_write_to(eager_5).is_err());
+        assert!(checker_5.can_write_to(eager_5).is_ok());
     }
 }

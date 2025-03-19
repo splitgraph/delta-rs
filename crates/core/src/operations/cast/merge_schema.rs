@@ -7,6 +7,7 @@ use arrow_schema::{
     ArrowError, DataType, Field as ArrowField, Fields, Schema as ArrowSchema,
     SchemaRef as ArrowSchemaRef,
 };
+use delta_kernel::schema::ColumnMetadataKey;
 
 use crate::kernel::{ArrayType, DataType as DeltaDataType, MapType, StructField, StructType};
 
@@ -18,12 +19,19 @@ fn try_merge_metadata<T: std::cmp::PartialEq + Clone>(
         if let Some(vl) = left.get(k) {
             if vl != v {
                 return Err(ArrowError::SchemaError(format!(
-                    "Cannot merge metadata with different values for key {}",
-                    k
+                    "Cannot merge metadata with different values for key {k}"
                 )));
             }
         } else {
-            left.insert(k.clone(), v.clone());
+            // I'm not sure if updating the schema metadata is even valid?
+            if k != ColumnMetadataKey::GenerationExpression.as_ref() {
+                // At least new generated expression may not be insert into existing column metadata!
+                left.insert(k.clone(), v.clone());
+            } else {
+                return Err(ArrowError::SchemaError(format!(
+                    "Cannot add generated expressions to exists columns {k}"
+                )));
+            }
         }
     }
     Ok(())
@@ -58,8 +66,7 @@ pub(crate) fn merge_delta_type(
             Ok(DeltaDataType::Struct(Box::new(merged)))
         }
         (a, b) => Err(ArrowError::SchemaError(format!(
-            "Cannot merge types {} and {}",
-            a, b
+            "Cannot merge types {a} and {b}"
         ))),
     }
 }
@@ -282,7 +289,7 @@ pub(crate) fn merge_arrow_field(
 /// Merges Arrow Table schema and Arrow Batch Schema, by allowing Large/View Types to passthrough.
 // Sometimes fields can't be merged because they are not the same types. So table has int32,
 // but batch int64. We want the preserve the table type. At later stage we will call cast_record_batch
-// which will cast the batch int64->int32. This is desired behaviour so we can have flexibility
+// which will cast the batch int64->int32. This is desired behavior so we can have flexibility
 // in the batch data types. But preserve the correct table and parquet types.
 //
 // Preserve_new_fields can also be disabled if you just want to only use the passthrough functionality
@@ -322,9 +329,13 @@ fn merge_arrow_vec_fields(
                         Err(e)
                     }
                     Ok(mut f) => {
-                        let mut field_matadata = f.metadata().clone();
-                        try_merge_metadata(&mut field_matadata, right_field.metadata())?;
-                        f.set_metadata(field_matadata);
+                        // UNDO the implicit schema merging of batch fields into table fields that is done by
+                        // field.try_merge
+                        f.set_metadata(right_field.metadata().clone());
+
+                        let mut field_metadata = f.metadata().clone();
+                        try_merge_metadata(&mut field_metadata, right_field.metadata())?;
+                        f.set_metadata(field_metadata);
                         Ok(f)
                     }
                 }
@@ -338,7 +349,15 @@ fn merge_arrow_vec_fields(
             if preserve_new_fields {
                 for field in batch_fields.into_iter() {
                     if table_fields.find(field.name()).is_none() {
-                        fields.push(field.as_ref().clone());
+                        if !field
+                            .metadata()
+                            .contains_key(ColumnMetadataKey::GenerationExpression.as_ref())
+                        {
+                            fields.push(field.as_ref().clone());
+                        } else {
+                            errors.push("Schema evolved fields cannot have generated expressions. Recreate the table to achieve this.".to_string());
+                            return Err(ArrowError::SchemaError(errors.join("\n")));
+                        }
                     }
                 }
             }

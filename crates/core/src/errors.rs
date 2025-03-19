@@ -1,4 +1,5 @@
 //! Exceptions for the deltalake crate
+use chrono::{DateTime, Utc};
 use object_store::Error as ObjectStoreError;
 
 use crate::operations::transaction::{CommitBuilderError, TransactionError};
@@ -230,8 +231,14 @@ pub enum DeltaTableError {
     #[error("Reading a table version: {version} that does not have change data enabled")]
     ChangeDataNotEnabled { version: i64 },
 
-    #[error("Invalid version start version {start} is greater than version {end}")]
+    #[error("Invalid version. Start version {start} is greater than end version {end}")]
     ChangeDataInvalidVersionRange { start: i64, end: i64 },
+
+    #[error("End timestamp {ending_timestamp} is greater than latest commit timestamp")]
+    ChangeDataTimestampGreaterThanCommit { ending_timestamp: DateTime<Utc> },
+
+    #[error("No starting version or timestamp provided for CDC")]
+    NoStartingVersionOrTimestamp,
 }
 
 impl From<object_store::path::Error> for DeltaTableError {

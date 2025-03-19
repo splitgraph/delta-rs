@@ -1,15 +1,18 @@
 use std::collections::{HashMap, HashSet};
-use std::fmt;
+use std::fmt::{self, Display};
 use std::str::FromStr;
 
+use delta_kernel::schema::{DataType, StructField};
 use maplit::hashset;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 use url::Url;
 
 use super::schema::StructType;
+use super::StructTypeExt;
 use crate::kernel::{error::Error, DeltaResult};
 use crate::TableProperty;
+use delta_kernel::table_features::{ReaderFeatures, WriterFeatures};
 
 /// Defines a file format used in table
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -86,7 +89,7 @@ impl Metadata {
             configuration,
             name: None,
             description: None,
-            created_time: None,
+            created_time: Some(chrono::Utc::now().timestamp_millis()),
         })
     }
 
@@ -108,10 +111,29 @@ impl Metadata {
         self
     }
 
+    /// set the table ID in the metadata action
+    pub fn with_table_id(mut self, id: String) -> Self {
+        self.id = id;
+        self
+    }
+
     /// get the table schema
     pub fn schema(&self) -> DeltaResult<StructType> {
         Ok(serde_json::from_str(&self.schema_string)?)
     }
+}
+
+/// checks if table contains timestamp_ntz in any field including nested fields.
+pub fn contains_timestampntz<'a>(mut fields: impl Iterator<Item = &'a StructField>) -> bool {
+    fn _check_type(dtype: &DataType) -> bool {
+        match dtype {
+            &DataType::TIMESTAMP_NTZ => true,
+            DataType::Array(inner) => _check_type(inner.element_type()),
+            DataType::Struct(inner) => inner.fields().any(|f| _check_type(f.data_type())),
+            _ => false,
+        }
+    }
+    fields.any(|f| _check_type(f.data_type()))
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
@@ -145,8 +167,8 @@ impl Protocol {
         }
     }
 
-    /// set the reader features in the protocol action, automatically bumps min_reader_version
-    pub fn with_reader_features(
+    /// Append the reader features in the protocol action, automatically bumps min_reader_version
+    pub fn append_reader_features(
         mut self,
         reader_features: impl IntoIterator<Item = impl Into<ReaderFeatures>>,
     ) -> Self {
@@ -155,46 +177,78 @@ impl Protocol {
             .map(Into::into)
             .collect::<HashSet<_>>();
         if !all_reader_features.is_empty() {
-            self.min_reader_version = 3
+            self.min_reader_version = 3;
+            match self.reader_features {
+                Some(mut features) => {
+                    features.extend(all_reader_features);
+                    self.reader_features = Some(features);
+                }
+                None => self.reader_features = Some(all_reader_features),
+            };
         }
-        self.reader_features = Some(all_reader_features);
         self
     }
 
-    /// set the writer features in the protocol action, automatically bumps min_writer_version
-    pub fn with_writer_features(
+    /// Append the writer features in the protocol action, automatically bumps min_writer_version
+    pub fn append_writer_features(
         mut self,
         writer_features: impl IntoIterator<Item = impl Into<WriterFeatures>>,
     ) -> Self {
-        let all_writer_feautures = writer_features
+        let all_writer_features = writer_features
             .into_iter()
             .map(|c| c.into())
             .collect::<HashSet<_>>();
-        if !all_writer_feautures.is_empty() {
-            self.min_writer_version = 7
+        if !all_writer_features.is_empty() {
+            self.min_writer_version = 7;
+
+            match self.writer_features {
+                Some(mut features) => {
+                    features.extend(all_writer_features);
+                    self.writer_features = Some(features);
+                }
+                None => self.writer_features = Some(all_writer_features),
+            };
         }
-        self.writer_features = Some(all_writer_feautures);
         self
     }
 
-    /// Converts existing properties into features if the reader_version is >=3 or writer_version >=3
+    /// Converts existing properties into features if the reader_version is >=3 or writer_version >=7
     /// only converts features that are "true"
     pub fn move_table_properties_into_features(
         mut self,
         configuration: &HashMap<String, Option<String>>,
     ) -> Protocol {
+        fn parse_bool(value: &Option<String>) -> bool {
+            value
+                .as_ref()
+                .is_some_and(|v| v.to_ascii_lowercase().parse::<bool>().is_ok_and(|v| v))
+        }
+
         if self.min_writer_version >= 7 {
+            // TODO: move this is in future to use delta_kernel::table_properties
             let mut converted_writer_features = configuration
                 .iter()
                 .filter(|(_, value)| {
-                    value.as_ref().map_or(false, |v| {
-                        v.to_ascii_lowercase().parse::<bool>().is_ok_and(|v| v)
-                    })
+                    value
+                        .as_ref()
+                        .is_some_and(|v| v.to_ascii_lowercase().parse::<bool>().is_ok_and(|v| v))
                 })
-                .collect::<HashMap<&String, &Option<String>>>()
-                .keys()
-                .map(|key| (*key).clone().into())
-                .filter(|v| !matches!(v, WriterFeatures::Other(_)))
+                .filter_map(|(key, value)| match key.as_str() {
+                    "delta.enableChangeDataFeed" if parse_bool(value) => {
+                        Some(WriterFeatures::ChangeDataFeed)
+                    }
+                    "delta.appendOnly" if parse_bool(value) => Some(WriterFeatures::AppendOnly),
+                    "delta.enableDeletionVectors" if parse_bool(value) => {
+                        Some(WriterFeatures::DeletionVectors)
+                    }
+                    "delta.enableRowTracking" if parse_bool(value) => {
+                        Some(WriterFeatures::RowTracking)
+                    }
+                    "delta.checkpointPolicy" if value.clone().unwrap_or_default() == "v2" => {
+                        Some(WriterFeatures::V2Checkpoint)
+                    }
+                    _ => None,
+                })
                 .collect::<HashSet<WriterFeatures>>();
 
             if configuration
@@ -212,16 +266,18 @@ impl Protocol {
                 None => self.writer_features = Some(converted_writer_features),
             }
         }
-        if self.min_reader_version > 3 {
+        if self.min_reader_version >= 3 {
             let converted_reader_features = configuration
                 .iter()
-                .filter(|(_, value)| {
-                    value.as_ref().map_or(false, |v| {
-                        v.to_ascii_lowercase().parse::<bool>().is_ok_and(|v| v)
-                    })
+                .filter_map(|(key, value)| match key.as_str() {
+                    "delta.enableDeletionVectors" if parse_bool(value) => {
+                        Some(ReaderFeatures::DeletionVectors)
+                    }
+                    "delta.checkpointPolicy" if value.clone().unwrap_or_default() == "v2" => {
+                        Some(ReaderFeatures::V2Checkpoint)
+                    }
+                    _ => None,
                 })
-                .map(|(key, _)| (*key).clone().into())
-                .filter(|v| !matches!(v, ReaderFeatures::Other(_)))
                 .collect::<HashSet<ReaderFeatures>>();
             match self.reader_features {
                 Some(mut features) => {
@@ -233,6 +289,32 @@ impl Protocol {
         }
         self
     }
+
+    /// Will apply the column metadata to the protocol by either bumping the version or setting
+    /// features
+    pub fn apply_column_metadata_to_protocol(
+        mut self,
+        schema: &StructType,
+    ) -> DeltaResult<Protocol> {
+        let generated_cols = schema.get_generated_columns()?;
+        let invariants = schema.get_invariants()?;
+        let contains_timestamp_ntz = self.contains_timestampntz(schema.fields());
+
+        if contains_timestamp_ntz {
+            self = self.enable_timestamp_ntz()
+        }
+
+        if !generated_cols.is_empty() {
+            self = self.enable_generated_columns()
+        }
+
+        if !invariants.is_empty() {
+            self = self.enable_invariants()
+        }
+
+        Ok(self)
+    }
+
     /// Will apply the properties to the protocol by either bumping the version or setting
     /// features
     pub fn apply_properties_to_protocol(
@@ -247,8 +329,7 @@ impl Protocol {
                 parsed_properties.insert(parsed_key, value.to_string());
             } else if raise_if_not_exists {
                 return Err(Error::Generic(format!(
-                    "Error parsing property '{}':'{}'",
-                    key, value
+                    "Error parsing property '{key}':'{value}'",
                 )));
             }
         }
@@ -264,17 +345,11 @@ impl Protocol {
                         }
                     }
                     _ => {
-                        return Err(Error::Generic(format!(
-                        "delta.minReaderVersion = '{}' is invalid, valid values are ['1','2','3']",
-                        min_reader_version
-                    )))
+                        return Err(Error::Generic(format!("delta.minReaderVersion = '{min_reader_version}' is invalid, valid values are ['1','2','3']")))
                     }
                 },
                 Err(_) => {
-                    return Err(Error::Generic(format!(
-                        "delta.minReaderVersion = '{}' is invalid, valid values are ['1','2','3']",
-                        min_reader_version
-                    )))
+                    return Err(Error::Generic(format!("delta.minReaderVersion = '{min_reader_version}' is invalid, valid values are ['1','2','3']")))
                 }
             }
         }
@@ -290,17 +365,11 @@ impl Protocol {
                         }
                     }
                     _ => {
-                        return Err(Error::Generic(format!(
-                            "delta.minWriterVersion = '{}' is invalid, valid values are ['2','3','4','5','6','7']",
-                            min_writer_version
-                        )))
+                        return Err(Error::Generic(format!("delta.minWriterVersion = '{min_writer_version}' is invalid, valid values are ['2','3','4','5','6','7']")))
                     }
                 },
                 Err(_) => {
-                    return Err(Error::Generic(format!(
-                        "delta.minWriterVersion = '{}' is invalid, valid values are ['2','3','4','5','6','7']",
-                        min_writer_version
-                    )))
+                    return Err(Error::Generic(format!("delta.minWriterVersion = '{min_writer_version}' is invalid, valid values are ['2','3','4','5','6','7']")))
                 }
             }
         }
@@ -327,10 +396,7 @@ impl Protocol {
                 }
                 Ok(false) => {}
                 _ => {
-                    return Err(Error::Generic(format!(
-                        "delta.enableChangeDataFeed = '{}' is invalid, valid values are ['true']",
-                        enable_cdf
-                    )))
+                    return Err(Error::Generic(format!("delta.enableChangeDataFeed = '{enable_cdf}' is invalid, valid values are ['true']")))
                 }
             }
         }
@@ -360,19 +426,41 @@ impl Protocol {
                 }
                 Ok(false) => {}
                 _ => {
-                    return Err(Error::Generic(format!(
-                        "delta.enableDeletionVectors = '{}' is invalid, valid values are ['true']",
-                        enable_dv
-                    )))
+                    return Err(Error::Generic(format!("delta.enableDeletionVectors = '{enable_dv}' is invalid, valid values are ['true']")))
                 }
             }
         }
         Ok(self)
     }
+
+    /// checks if table contains timestamp_ntz in any field including nested fields.
+    fn contains_timestampntz<'a>(&self, fields: impl Iterator<Item = &'a StructField>) -> bool {
+        contains_timestampntz(fields)
+    }
+
     /// Enable timestamp_ntz in the protocol
-    pub fn enable_timestamp_ntz(mut self) -> Protocol {
-        self = self.with_reader_features(vec![ReaderFeatures::TimestampWithoutTimezone]);
-        self = self.with_writer_features(vec![WriterFeatures::TimestampWithoutTimezone]);
+    fn enable_timestamp_ntz(mut self) -> Self {
+        self = self.append_reader_features([ReaderFeatures::TimestampWithoutTimezone]);
+        self = self.append_writer_features([WriterFeatures::TimestampWithoutTimezone]);
+        self
+    }
+
+    /// Enabled generated columns
+    fn enable_generated_columns(mut self) -> Self {
+        if self.min_writer_version < 4 {
+            self.min_writer_version = 4;
+        }
+        if self.min_writer_version >= 7 {
+            self = self.append_writer_features([WriterFeatures::GeneratedColumns]);
+        }
+        self
+    }
+
+    /// Enabled generated columns
+    fn enable_invariants(mut self) -> Self {
+        if self.min_writer_version >= 7 {
+            self = self.append_writer_features([WriterFeatures::Invariants]);
+        }
         self
     }
 }
@@ -459,225 +547,28 @@ impl fmt::Display for TableFeatures {
     }
 }
 
+impl TryFrom<&TableFeatures> for ReaderFeatures {
+    type Error = strum::ParseError;
+
+    fn try_from(value: &TableFeatures) -> Result<Self, Self::Error> {
+        ReaderFeatures::try_from(value.as_ref())
+    }
+}
+
+impl TryFrom<&TableFeatures> for WriterFeatures {
+    type Error = strum::ParseError;
+
+    fn try_from(value: &TableFeatures) -> Result<Self, Self::Error> {
+        WriterFeatures::try_from(value.as_ref())
+    }
+}
+
 impl TableFeatures {
     /// Convert table feature to respective reader or/and write feature
     pub fn to_reader_writer_features(&self) -> (Option<ReaderFeatures>, Option<WriterFeatures>) {
         let reader_feature = ReaderFeatures::try_from(self).ok();
         let writer_feature = WriterFeatures::try_from(self).ok();
         (reader_feature, writer_feature)
-    }
-}
-
-/// Features table readers can support as well as let users know
-/// what is supported
-#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq, Hash)]
-#[serde(rename_all = "camelCase")]
-pub enum ReaderFeatures {
-    /// Mapping of one column to another
-    ColumnMapping,
-    /// Deletion vectors for merge, update, delete
-    DeletionVectors,
-    /// timestamps without timezone support
-    #[serde(rename = "timestampNtz")]
-    TimestampWithoutTimezone,
-    /// version 2 of checkpointing
-    V2Checkpoint,
-    /// If we do not match any other reader features
-    #[serde(untagged)]
-    Other(String),
-}
-
-impl From<&parquet::record::Field> for ReaderFeatures {
-    fn from(value: &parquet::record::Field) -> Self {
-        match value {
-            parquet::record::Field::Str(feature) => match feature.as_str() {
-                "columnMapping" => ReaderFeatures::ColumnMapping,
-                "deletionVectors" | "delta.enableDeletionVectors" => {
-                    ReaderFeatures::DeletionVectors
-                }
-                "timestampNtz" => ReaderFeatures::TimestampWithoutTimezone,
-                "v2Checkpoint" => ReaderFeatures::V2Checkpoint,
-                f => ReaderFeatures::Other(f.to_string()),
-            },
-            f => ReaderFeatures::Other(f.to_string()),
-        }
-    }
-}
-
-impl From<String> for ReaderFeatures {
-    fn from(value: String) -> Self {
-        value.as_str().into()
-    }
-}
-
-impl From<&str> for ReaderFeatures {
-    fn from(value: &str) -> Self {
-        match value {
-            "columnMapping" => ReaderFeatures::ColumnMapping,
-            "deletionVectors" => ReaderFeatures::DeletionVectors,
-            "timestampNtz" => ReaderFeatures::TimestampWithoutTimezone,
-            "v2Checkpoint" => ReaderFeatures::V2Checkpoint,
-            f => ReaderFeatures::Other(f.to_string()),
-        }
-    }
-}
-
-impl AsRef<str> for ReaderFeatures {
-    fn as_ref(&self) -> &str {
-        match self {
-            ReaderFeatures::ColumnMapping => "columnMapping",
-            ReaderFeatures::DeletionVectors => "deletionVectors",
-            ReaderFeatures::TimestampWithoutTimezone => "timestampNtz",
-            ReaderFeatures::V2Checkpoint => "v2Checkpoint",
-            ReaderFeatures::Other(f) => f,
-        }
-    }
-}
-
-impl fmt::Display for ReaderFeatures {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_ref())
-    }
-}
-
-impl TryFrom<&TableFeatures> for ReaderFeatures {
-    type Error = String;
-
-    fn try_from(value: &TableFeatures) -> Result<Self, Self::Error> {
-        match ReaderFeatures::from(value.as_ref()) {
-            ReaderFeatures::Other(_) => {
-                Err(format!("Table feature {} is not a reader feature", value))
-            }
-            value => Ok(value),
-        }
-    }
-}
-
-/// Features table writers can support as well as let users know
-/// what is supported
-#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq, Hash)]
-#[serde(rename_all = "camelCase")]
-pub enum WriterFeatures {
-    /// Append Only Tables
-    AppendOnly,
-    /// Table invariants
-    Invariants,
-    /// Check constraints on columns
-    CheckConstraints,
-    /// CDF on a table
-    ChangeDataFeed,
-    /// Columns with generated values
-    GeneratedColumns,
-    /// Mapping of one column to another
-    ColumnMapping,
-    /// ID Columns
-    IdentityColumns,
-    /// Deletion vectors for merge, update, delete
-    DeletionVectors,
-    /// Row tracking on tables
-    RowTracking,
-    /// timestamps without timezone support
-    #[serde(rename = "timestampNtz")]
-    TimestampWithoutTimezone,
-    /// domain specific metadata
-    DomainMetadata,
-    /// version 2 of checkpointing
-    V2Checkpoint,
-    /// Iceberg compatibility support
-    IcebergCompatV1,
-    /// If we do not match any other reader features
-    #[serde(untagged)]
-    Other(String),
-}
-
-impl From<String> for WriterFeatures {
-    fn from(value: String) -> Self {
-        value.as_str().into()
-    }
-}
-
-impl From<&str> for WriterFeatures {
-    fn from(value: &str) -> Self {
-        match value {
-            "appendOnly" | "delta.appendOnly" => WriterFeatures::AppendOnly,
-            "invariants" => WriterFeatures::Invariants,
-            "checkConstraints" => WriterFeatures::CheckConstraints,
-            "changeDataFeed" | "delta.enableChangeDataFeed" => WriterFeatures::ChangeDataFeed,
-            "generatedColumns" => WriterFeatures::GeneratedColumns,
-            "columnMapping" => WriterFeatures::ColumnMapping,
-            "identityColumns" => WriterFeatures::IdentityColumns,
-            "deletionVectors" | "delta.enableDeletionVectors" => WriterFeatures::DeletionVectors,
-            "rowTracking" | "delta.enableRowTracking" => WriterFeatures::RowTracking,
-            "timestampNtz" => WriterFeatures::TimestampWithoutTimezone,
-            "domainMetadata" => WriterFeatures::DomainMetadata,
-            "v2Checkpoint" => WriterFeatures::V2Checkpoint,
-            "icebergCompatV1" => WriterFeatures::IcebergCompatV1,
-            f => WriterFeatures::Other(f.to_string()),
-        }
-    }
-}
-
-impl AsRef<str> for WriterFeatures {
-    fn as_ref(&self) -> &str {
-        match self {
-            WriterFeatures::AppendOnly => "appendOnly",
-            WriterFeatures::Invariants => "invariants",
-            WriterFeatures::CheckConstraints => "checkConstraints",
-            WriterFeatures::ChangeDataFeed => "changeDataFeed",
-            WriterFeatures::GeneratedColumns => "generatedColumns",
-            WriterFeatures::ColumnMapping => "columnMapping",
-            WriterFeatures::IdentityColumns => "identityColumns",
-            WriterFeatures::DeletionVectors => "deletionVectors",
-            WriterFeatures::RowTracking => "rowTracking",
-            WriterFeatures::TimestampWithoutTimezone => "timestampNtz",
-            WriterFeatures::DomainMetadata => "domainMetadata",
-            WriterFeatures::V2Checkpoint => "v2Checkpoint",
-            WriterFeatures::IcebergCompatV1 => "icebergCompatV1",
-            WriterFeatures::Other(f) => f,
-        }
-    }
-}
-
-impl fmt::Display for WriterFeatures {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_ref())
-    }
-}
-
-impl TryFrom<&TableFeatures> for WriterFeatures {
-    type Error = String;
-
-    fn try_from(value: &TableFeatures) -> Result<Self, Self::Error> {
-        match WriterFeatures::from(value.as_ref()) {
-            WriterFeatures::Other(_) => {
-                Err(format!("Table feature {} is not a writer feature", value))
-            }
-            value => Ok(value),
-        }
-    }
-}
-
-impl From<&parquet::record::Field> for WriterFeatures {
-    fn from(value: &parquet::record::Field) -> Self {
-        match value {
-            parquet::record::Field::Str(feature) => match feature.as_str() {
-                "appendOnly" => WriterFeatures::AppendOnly,
-                "invariants" => WriterFeatures::Invariants,
-                "checkConstraints" => WriterFeatures::CheckConstraints,
-                "changeDataFeed" => WriterFeatures::ChangeDataFeed,
-                "generatedColumns" => WriterFeatures::GeneratedColumns,
-                "columnMapping" => WriterFeatures::ColumnMapping,
-                "identityColumns" => WriterFeatures::IdentityColumns,
-                "deletionVectors" => WriterFeatures::DeletionVectors,
-                "rowTracking" => WriterFeatures::RowTracking,
-                "timestampNtz" => WriterFeatures::TimestampWithoutTimezone,
-                "domainMetadata" => WriterFeatures::DomainMetadata,
-                "v2Checkpoint" => WriterFeatures::V2Checkpoint,
-                "icebergCompatV1" => WriterFeatures::IcebergCompatV1,
-                f => WriterFeatures::Other(f.to_string()),
-            },
-            f => WriterFeatures::Other(f.to_string()),
-        }
     }
 }
 
@@ -726,9 +617,9 @@ impl AsRef<str> for StorageType {
     }
 }
 
-impl ToString for StorageType {
-    fn to_string(&self) -> String {
-        self.as_ref().into()
+impl Display for StorageType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_ref())
     }
 }
 
@@ -783,14 +674,13 @@ impl DeletionVectorDescriptor {
                 let mut dv_suffix = format!("deletion_vector_{uuid}.bin");
                 if prefix_len > 0 {
                     dv_suffix = format!(
-                        "{}/{}",
+                        "{}/{dv_suffix}",
                         &self.path_or_inline_dv[..(prefix_len as usize)],
-                        dv_suffix
                     );
                 }
                 let dv_path = parent
                     .join(&dv_suffix)
-                    .map_err(|_| Error::DeletionVector(format!("invalid path: {}", dv_suffix)))?;
+                    .map_err(|_| Error::DeletionVector(format!("invalid path: {dv_suffix}")))?;
                 Ok(Some(dv_path))
             }
             StorageType::AbsolutePath => {
@@ -839,7 +729,7 @@ impl DeletionVectorDescriptor {
     //                 i32::from_le_bytes(buf.try_into().map_err(|_| {
     //                     Error::DeletionVector("filed to read magic bytes".to_string())
     //                 })?);
-    //             println!("magic  --> : {}", magic);
+    //             println!("magic  --> : {magic}");
     //             // assert!(magic == 1681511377);
     //
     //             let mut buf = vec![0; size_in_bytes as usize];
@@ -887,6 +777,7 @@ pub struct Add {
     /// Map containing metadata about this logical file.
     pub tags: Option<HashMap<String, Option<String>>>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
     /// Information about deletion vector (DV) associated with this add action
     pub deletion_vector: Option<DeletionVectorDescriptor>,
 
@@ -1317,7 +1208,7 @@ mod tests {
     #[test]
     fn test_primitive() {
         let types: PrimitiveType = serde_json::from_str("\"string\"").unwrap();
-        println!("{:?}", types);
+        println!("{types:?}");
     }
 
     // #[test]

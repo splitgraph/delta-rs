@@ -182,36 +182,39 @@ pub(crate) fn generalize_filter(
     source_name: &TableReference,
     target_name: &TableReference,
     placeholders: &mut Vec<PredicatePlaceholder>,
+    streaming_source: bool,
 ) -> Option<Expr> {
     match predicate {
         Expr::BinaryExpr(binary) => {
-            if references_table(&binary.right, source_name).has_reference() {
-                if let ReferenceTableCheck::HasReference(left_target) =
-                    references_table(&binary.left, target_name)
-                {
-                    return construct_placeholder(
-                        binary,
-                        false,
-                        partition_columns.contains(&left_target),
-                        left_target,
-                        placeholders,
-                    );
+            if !streaming_source {
+                if references_table(&binary.right, source_name).has_reference() {
+                    if let ReferenceTableCheck::HasReference(left_target) =
+                        references_table(&binary.left, target_name)
+                    {
+                        return construct_placeholder(
+                            binary,
+                            false,
+                            partition_columns.contains(&left_target),
+                            left_target,
+                            placeholders,
+                        );
+                    }
+                    return None;
                 }
-                return None;
-            }
-            if references_table(&binary.left, source_name).has_reference() {
-                if let ReferenceTableCheck::HasReference(right_target) =
-                    references_table(&binary.right, target_name)
-                {
-                    return construct_placeholder(
-                        binary,
-                        true,
-                        partition_columns.contains(&right_target),
-                        right_target,
-                        placeholders,
-                    );
+                if references_table(&binary.left, source_name).has_reference() {
+                    if let ReferenceTableCheck::HasReference(right_target) =
+                        references_table(&binary.right, target_name)
+                    {
+                        return construct_placeholder(
+                            binary,
+                            true,
+                            partition_columns.contains(&right_target),
+                            right_target,
+                            placeholders,
+                        );
+                    }
+                    return None;
                 }
-                return None;
             }
 
             let left = generalize_filter(
@@ -220,6 +223,7 @@ pub(crate) fn generalize_filter(
                 source_name,
                 target_name,
                 placeholders,
+                streaming_source,
             );
             let right = generalize_filter(
                 *binary.right,
@@ -227,6 +231,7 @@ pub(crate) fn generalize_filter(
                 source_name,
                 target_name,
                 placeholders,
+                streaming_source,
             );
 
             match (left, right) {
@@ -252,16 +257,14 @@ pub(crate) fn generalize_filter(
             }
         }
         Expr::InList(in_list) => {
-            let compare_expr = match generalize_filter(
+            let compare_expr = generalize_filter(
                 *in_list.expr,
                 partition_columns,
                 source_name,
                 target_name,
                 placeholders,
-            ) {
-                Some(expr) => expr,
-                None => return None, // Return early
-            };
+                streaming_source,
+            )?;
 
             let mut list_expr = Vec::new();
             for item in in_list.list.into_iter() {
@@ -275,6 +278,7 @@ pub(crate) fn generalize_filter(
                             source_name,
                             target_name,
                             placeholders,
+                            streaming_source,
                         ) {
                             list_expr.push(item)
                         }
@@ -294,19 +298,23 @@ pub(crate) fn generalize_filter(
         }
         other => match references_table(&other, source_name) {
             ReferenceTableCheck::HasReference(col) => {
-                let placeholder_name = format!("{col}_{}", placeholders.len());
+                if !streaming_source {
+                    let placeholder_name = format!("{col}_{}", placeholders.len());
 
-                let placeholder = Expr::Placeholder(Placeholder {
-                    id: placeholder_name.clone(),
-                    data_type: None,
-                });
+                    let placeholder = Expr::Placeholder(Placeholder {
+                        id: placeholder_name.clone(),
+                        data_type: None,
+                    });
 
-                placeholders.push(PredicatePlaceholder {
-                    expr: other,
-                    alias: placeholder_name,
-                    is_aggregate: true,
-                });
-                Some(placeholder)
+                    placeholders.push(PredicatePlaceholder {
+                        expr: other,
+                        alias: placeholder_name,
+                        is_aggregate: true,
+                    });
+                    Some(placeholder)
+                } else {
+                    None
+                }
             }
             ReferenceTableCheck::NoReference => Some(other),
             ReferenceTableCheck::Unknown => None,
@@ -321,6 +329,7 @@ pub(crate) async fn try_construct_early_filter(
     source: &LogicalPlan,
     source_name: &TableReference,
     target_name: &TableReference,
+    streaming_source: bool,
 ) -> DeltaResult<Option<Expr>> {
     let table_metadata = table_snapshot.metadata();
     let partition_columns = &table_metadata.partition_columns;
@@ -333,10 +342,11 @@ pub(crate) async fn try_construct_early_filter(
         source_name,
         target_name,
         &mut placeholders,
+        streaming_source,
     ) {
         None => Ok(None),
         Some(filter) => {
-            if placeholders.is_empty() {
+            if placeholders.is_empty() || streaming_source {
                 // if we haven't recognised any source predicates in the join predicate, return our filter with static only predicates
                 Ok(Some(filter))
             } else {
@@ -385,7 +395,6 @@ pub(crate) async fn try_construct_early_filter(
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use crate::operations::merge::tests::setup_table;
@@ -444,14 +453,7 @@ mod tests {
         .build()
         .unwrap();
 
-        let join_predicate = col(Column {
-            relation: Some(source_name.clone()),
-            name: "id".to_owned(),
-        })
-        .eq(col(Column {
-            relation: Some(target_name.clone()),
-            name: "id".to_owned(),
-        }));
+        let join_predicate = make_join_predicate(&source_name, &target_name);
 
         let pred = try_construct_early_filter(
             join_predicate,
@@ -460,6 +462,7 @@ mod tests {
             &source,
             &source_name,
             &target_name,
+            false,
         )
         .await
         .unwrap();
@@ -541,14 +544,7 @@ mod tests {
         .build()
         .unwrap();
 
-        let join_predicate = col(Column {
-            relation: Some(source_name.clone()),
-            name: "id".to_owned(),
-        })
-        .eq(col(Column {
-            relation: Some(target_name.clone()),
-            name: "id".to_owned(),
-        }));
+        let join_predicate = make_join_predicate(&source_name, &target_name);
 
         let pred = try_construct_early_filter(
             join_predicate,
@@ -557,20 +553,14 @@ mod tests {
             &source,
             &source_name,
             &target_name,
+            false,
         )
         .await
         .unwrap();
 
         assert!(pred.is_some());
 
-        let filter = col(Column {
-            relation: Some(target_name.clone()),
-            name: "id".to_owned(),
-        })
-        .between(
-            Expr::Literal(ScalarValue::Utf8(Some("B".to_string()))),
-            Expr::Literal(ScalarValue::Utf8(Some("C".to_string()))),
-        );
+        let filter = col(Column::new(Some(target_name.clone()), "id")).between(lit("B"), lit("C"));
         assert_eq!(pred.unwrap(), filter);
     }
 
@@ -609,23 +599,9 @@ mod tests {
         .build()
         .unwrap();
 
-        let join_predicate = col(Column {
-            relation: Some(source_name.clone()),
-            name: "id".to_owned(),
-        })
-        .eq(col(Column {
-            relation: Some(target_name.clone()),
-            name: "id".to_owned(),
-        }))
-        .and(
-            col(Column {
-                relation: Some(source_name.clone()),
-                name: "modified".to_owned(),
-            })
-            .eq(col(Column {
-                relation: Some(target_name.clone()),
-                name: "modified".to_owned(),
-            })),
+        let join_predicate = make_join_predicate(&source_name, &target_name).and(
+            col(Column::new(Some(source_name.clone()), "modified"))
+                .eq(col(Column::new(Some(target_name.clone()), "modified"))),
         );
 
         let pred = try_construct_early_filter(
@@ -635,26 +611,16 @@ mod tests {
             &source,
             &source_name,
             &target_name,
+            false,
         )
         .await
         .unwrap();
 
         assert!(pred.is_some());
 
-        let filter = col(Column {
-            relation: Some(target_name.clone()),
-            name: "id".to_owned(),
-        })
-        .between(
-            Expr::Literal(ScalarValue::Utf8(Some("B".to_string()))),
-            Expr::Literal(ScalarValue::Utf8(Some("C".to_string()))),
-        )
-        .and(
-            Expr::Literal(ScalarValue::Utf8(Some("2023-07-04".to_string()))).eq(col(Column {
-                relation: Some(target_name.clone()),
-                name: "modified".to_owned(),
-            })),
-        );
+        let filter = col(Column::new(Some(target_name.clone()), "id"))
+            .between(lit("B"), lit("C"))
+            .and(lit("2023-07-04").eq(col(Column::new(Some(target_name.clone()), "modified"))));
         assert_eq!(pred.unwrap(), filter);
     }
 
@@ -694,18 +660,12 @@ mod tests {
         .build()
         .unwrap();
 
-        let join_predicate = col(Column {
-            relation: Some(source_name.clone()),
-            name: "id".to_owned(),
-        })
-        .eq(col(Column {
-            relation: Some(target_name.clone()),
-            name: "id".to_owned(),
-        }))
-        .and(col("modified".to_owned()).in_list(
-            vec![lit("2023-07-05"), lit("2023-07-06"), lit("2023-07-07")],
-            false,
-        ));
+        let join_predicate = make_join_predicate(&source_name, &target_name).and(
+            col("modified".to_owned()).in_list(
+                vec![lit("2023-07-05"), lit("2023-07-06"), lit("2023-07-07")],
+                false,
+            ),
+        );
 
         let pred = try_construct_early_filter(
             join_predicate,
@@ -714,34 +674,19 @@ mod tests {
             &source_plan,
             &source_name,
             &target_name,
+            false,
         )
         .await
         .unwrap();
 
         assert!(pred.is_some());
 
-        let filter = col(Column {
-            relation: Some(target_name.clone()),
-            name: "id".to_owned(),
-        })
-        .between(
-            Expr::Literal(ScalarValue::Utf8(Some("A".to_string()))),
-            Expr::Literal(ScalarValue::Utf8(Some("C".to_string()))),
-        )
-        .and(
-            col(Column {
-                relation: None,
-                name: "modified".to_owned(),
-            })
-            .in_list(
-                vec![
-                    Expr::Literal(ScalarValue::Utf8(Some("2023-07-05".to_string()))),
-                    Expr::Literal(ScalarValue::Utf8(Some("2023-07-06".to_string()))),
-                    Expr::Literal(ScalarValue::Utf8(Some("2023-07-07".to_string()))),
-                ],
+        let filter = col(Column::new(Some(target_name.clone()), "id"))
+            .between(lit("A"), lit("C"))
+            .and(col(Column::new_unqualified("modified")).in_list(
+                vec![lit("2023-07-05"), lit("2023-07-06"), lit("2023-07-07")],
                 false,
-            ),
-        );
+            ));
         assert_eq!(pred.unwrap(), filter);
     }
 
@@ -781,27 +726,15 @@ mod tests {
         .build()
         .unwrap();
 
-        let join_predicate = col(Column {
-            relation: Some(source_name.clone()),
-            name: "id".to_owned(),
-        })
-        .eq(col(Column {
-            relation: Some(target_name.clone()),
-            name: "id".to_owned(),
-        }))
-        .and(col("modified".to_owned()).in_list(
-            vec![
-                col(Column {
-                    relation: Some(target_name.clone()),
-                    name: "id".to_owned(),
-                }),
-                col(Column {
-                    relation: Some(target_name.clone()),
-                    name: "modified".to_owned(),
-                }),
-            ],
-            false,
-        ));
+        let join_predicate = make_join_predicate(&source_name, &target_name).and(
+            col("modified".to_owned()).in_list(
+                vec![
+                    col(Column::new(Some(target_name.clone()), "id")),
+                    col(Column::new(Some(target_name.clone()), "modified")),
+                ],
+                false,
+            ),
+        );
 
         let pred = try_construct_early_filter(
             join_predicate,
@@ -810,39 +743,22 @@ mod tests {
             &source_plan,
             &source_name,
             &target_name,
+            false,
         )
         .await
         .unwrap();
 
         assert!(pred.is_some());
 
-        let filter = col(Column {
-            relation: Some(target_name.clone()),
-            name: "id".to_owned(),
-        })
-        .between(
-            Expr::Literal(ScalarValue::Utf8(Some("A".to_string()))),
-            Expr::Literal(ScalarValue::Utf8(Some("C".to_string()))),
-        )
-        .and(
-            col(Column {
-                relation: None,
-                name: "modified".to_owned(),
-            })
-            .in_list(
+        let filter = col(Column::new(Some(target_name.clone()), "id"))
+            .between(lit("A"), lit("C"))
+            .and(col(Column::new_unqualified("modified")).in_list(
                 vec![
-                    col(Column {
-                        relation: Some(target_name.clone()),
-                        name: "id".to_owned(),
-                    }),
-                    col(Column {
-                        relation: Some(target_name.clone()),
-                        name: "modified".to_owned(),
-                    }),
+                    col(Column::new(Some(target_name.clone()), "id")),
+                    col(Column::new(Some(target_name.clone()), "modified")),
                 ],
                 false,
-            ),
-        );
+            ));
         assert_eq!(pred.unwrap(), filter);
     }
 
@@ -882,27 +798,15 @@ mod tests {
         .build()
         .unwrap();
 
-        let join_predicate = col(Column {
-            relation: Some(source_name.clone()),
-            name: "id".to_owned(),
-        })
-        .eq(col(Column {
-            relation: Some(target_name.clone()),
-            name: "id".to_owned(),
-        }))
-        .and(ident("source.id").in_list(
-            vec![
-                col(Column {
-                    relation: Some(target_name.clone()),
-                    name: "id".to_owned(),
-                }),
-                col(Column {
-                    relation: Some(target_name.clone()),
-                    name: "modified".to_owned(),
-                }),
-            ],
-            false,
-        ));
+        let join_predicate = col(Column::new(Some(source_name.clone()), "id"))
+            .eq(col(Column::new(Some(target_name.clone()), "id")))
+            .and(ident("source.id").in_list(
+                vec![
+                    col(Column::new(Some(target_name.clone()), "id")),
+                    col(Column::new(Some(target_name.clone()), "modified")),
+                ],
+                false,
+            ));
 
         let pred = try_construct_early_filter(
             join_predicate,
@@ -911,33 +815,30 @@ mod tests {
             &source_plan,
             &source_name,
             &target_name,
+            false,
         )
         .await
         .unwrap();
 
         assert!(pred.is_some());
 
-        let filter = col(Column {
-            relation: Some(target_name.clone()),
-            name: "id".to_owned(),
-        })
-        .between(
-            Expr::Literal(ScalarValue::Utf8(Some("A".to_string()))),
-            Expr::Literal(ScalarValue::Utf8(Some("C".to_string()))),
-        )
-        .and(ident("source.id").in_list(
-            vec![
-                col(Column {
-                    relation: Some(target_name.clone()),
-                    name: "id".to_owned(),
-                }),
-                col(Column {
-                    relation: Some(target_name.clone()),
-                    name: "modified".to_owned(),
-                }),
-            ],
-            false,
-        ));
+        let filter = col(Column::new(Some(target_name.clone()), "id"))
+            .between(lit("A"), lit("C"))
+            .and(ident("source.id").in_list(
+                vec![
+                    col(Column::new(Some(target_name.clone()), "id")),
+                    col(Column::new(Some(target_name.clone()), "modified")),
+                ],
+                false,
+            ));
         assert_eq!(pred.unwrap(), filter);
+    }
+
+    /// return a join predicate for the source and target tables
+    ///
+    /// `source.id = target.id`
+    fn make_join_predicate(source_name: &TableReference, target_name: &TableReference) -> Expr {
+        col(Column::new(Some(source_name.clone()), "id"))
+            .eq(col(Column::new(Some(target_name.clone()), "id")))
     }
 }

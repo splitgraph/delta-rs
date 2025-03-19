@@ -6,15 +6,14 @@ use std::sync::Arc;
 
 use delta_kernel::schema::MetadataValue;
 use futures::future::BoxFuture;
-use maplit::hashset;
 use serde_json::Value;
 use tracing::log::*;
+use uuid::Uuid;
 
-use super::transaction::{CommitBuilder, TableReference, PROTOCOL};
+use super::transaction::{CommitBuilder, CommitProperties, TableReference, PROTOCOL};
+use super::{CustomExecuteHandler, Operation};
 use crate::errors::{DeltaResult, DeltaTableError};
-use crate::kernel::{
-    Action, DataType, Metadata, Protocol, ReaderFeatures, StructField, StructType, WriterFeatures,
-};
+use crate::kernel::{Action, DataType, Metadata, Protocol, StructField, StructType};
 use crate::logstore::{LogStore, LogStoreRef};
 use crate::protocol::{DeltaOperation, SaveMode};
 use crate::table::builder::ensure_table_uri;
@@ -48,7 +47,7 @@ impl From<CreateError> for DeltaTableError {
 }
 
 /// Build an operation to create a new [DeltaTable]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CreateBuilder {
     name: Option<String>,
     location: Option<String>,
@@ -60,11 +59,22 @@ pub struct CreateBuilder {
     actions: Vec<Action>,
     log_store: Option<LogStoreRef>,
     configuration: HashMap<String, Option<String>>,
-    metadata: Option<HashMap<String, Value>>,
+    /// Additional information to add to the commit
+    commit_properties: CommitProperties,
     raise_if_key_not_exists: bool,
+    custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
 }
 
-impl super::Operation<()> for CreateBuilder {}
+impl super::Operation<()> for CreateBuilder {
+    fn log_store(&self) -> &LogStoreRef {
+        self.log_store
+            .as_ref()
+            .expect("Logstore shouldn't be none at this stage.")
+    }
+    fn get_custom_execute_handler(&self) -> Option<Arc<dyn CustomExecuteHandler>> {
+        self.custom_execute_handler.clone()
+    }
+}
 
 impl Default for CreateBuilder {
     fn default() -> Self {
@@ -86,8 +96,9 @@ impl CreateBuilder {
             actions: Default::default(),
             log_store: None,
             configuration: Default::default(),
-            metadata: Default::default(),
+            commit_properties: CommitProperties::default(),
             raise_if_key_not_exists: true,
+            custom_execute_handler: None,
         }
     }
 
@@ -202,19 +213,13 @@ impl CreateBuilder {
         self
     }
 
-    /// Append custom (application-specific) metadata to the commit.
-    ///
-    /// This might include provenance information such as an id of the
-    /// user that made the commit or the program that created it.
-    pub fn with_metadata(
-        mut self,
-        metadata: impl IntoIterator<Item = (String, serde_json::Value)>,
-    ) -> Self {
-        self.metadata = Some(HashMap::from_iter(metadata));
+    /// Additional metadata to be added to commit info
+    pub fn with_commit_properties(mut self, commit_properties: CommitProperties) -> Self {
+        self.commit_properties = commit_properties;
         self
     }
 
-    /// Specify whether to raise an error if the table properties in the configuration are not TablePropertys
+    /// Specify whether to raise an error if the table properties in the configuration are not TableProperties
     pub fn with_raise_if_key_not_exists(mut self, raise_if_key_not_exists: bool) -> Self {
         self.raise_if_key_not_exists = raise_if_key_not_exists;
         self
@@ -235,10 +240,16 @@ impl CreateBuilder {
         self
     }
 
+    /// Set a custom execute handler, for pre and post execution
+    pub fn with_custom_execute_handler(mut self, handler: Arc<dyn CustomExecuteHandler>) -> Self {
+        self.custom_execute_handler = Some(handler);
+        self
+    }
+
     /// Consume self into uninitialized table with corresponding create actions and operation meta
-    pub(crate) fn into_table_and_actions(
-        self,
-    ) -> DeltaResult<(DeltaTable, Vec<Action>, DeltaOperation)> {
+    pub(crate) async fn into_table_and_actions(
+        mut self,
+    ) -> DeltaResult<(DeltaTable, Vec<Action>, DeltaOperation, Uuid)> {
         if self
             .actions
             .iter()
@@ -256,34 +267,27 @@ impl CreateBuilder {
                 DeltaTable::new(log_store, Default::default()),
             )
         } else {
-            let storage_url = ensure_table_uri(self.location.ok_or(CreateError::MissingLocation)?)?;
+            let storage_url =
+                ensure_table_uri(self.location.clone().ok_or(CreateError::MissingLocation)?)?;
             (
                 storage_url.as_str().to_string(),
                 DeltaTableBuilder::from_uri(&storage_url)
-                    .with_storage_options(self.storage_options.unwrap_or_default())
+                    .with_storage_options(self.storage_options.clone().unwrap_or_default())
                     .build()?,
             )
         };
 
-        let configuration = self.configuration;
-        let contains_timestampntz = PROTOCOL.contains_timestampntz(self.columns.iter());
-        // TODO configure more permissive versions based on configuration. Also how should this ideally be handled?
-        // We set the lowest protocol we can, and if subsequent writes use newer features we update metadata?
+        self.log_store = Some(table.log_store());
+        let operation_id = self.get_operation_id();
+        self.pre_execute(operation_id).await?;
 
-        let current_protocol = if contains_timestampntz {
-            Protocol {
-                min_reader_version: 3,
-                min_writer_version: 7,
-                writer_features: Some(hashset! {WriterFeatures::TimestampWithoutTimezone}),
-                reader_features: Some(hashset! {ReaderFeatures::TimestampWithoutTimezone}),
-            }
-        } else {
-            Protocol {
-                min_reader_version: PROTOCOL.default_reader_version(),
-                min_writer_version: PROTOCOL.default_writer_version(),
-                reader_features: None,
-                writer_features: None,
-            }
+        let configuration = self.configuration;
+
+        let current_protocol = Protocol {
+            min_reader_version: PROTOCOL.default_reader_version(),
+            min_writer_version: PROTOCOL.default_writer_version(),
+            reader_features: None,
+            writer_features: None,
         };
 
         let protocol = self
@@ -296,18 +300,21 @@ impl CreateBuilder {
             })
             .unwrap_or_else(|| current_protocol);
 
-        let protocol = protocol.apply_properties_to_protocol(
-            &configuration
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone().unwrap()))
-                .collect::<HashMap<String, String>>(),
-            self.raise_if_key_not_exists,
-        )?;
+        let schema = StructType::new(self.columns);
 
-        let protocol = protocol.move_table_properties_into_features(&configuration);
+        let protocol = protocol
+            .apply_properties_to_protocol(
+                &configuration
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone().unwrap()))
+                    .collect::<HashMap<String, String>>(),
+                self.raise_if_key_not_exists,
+            )?
+            .apply_column_metadata_to_protocol(&schema)?
+            .move_table_properties_into_features(&configuration);
 
         let mut metadata = Metadata::try_new(
-            StructType::new(self.columns),
+            schema,
             self.partition_columns.unwrap_or_default(),
             configuration,
         )?
@@ -334,7 +341,7 @@ impl CreateBuilder {
                 .filter(|a| !matches!(a, Action::Protocol(_))),
         );
 
-        Ok((table, actions, operation))
+        Ok((table, actions, operation, operation_id))
     }
 }
 
@@ -345,12 +352,12 @@ impl std::future::IntoFuture for CreateBuilder {
     fn into_future(self) -> Self::IntoFuture {
         let this = self;
         Box::pin(async move {
-            let mode = this.mode;
-            let app_metadata = this.metadata.clone().unwrap_or_default();
-            let (mut table, mut actions, operation) = this.into_table_and_actions()?;
-            let log_store = table.log_store();
+            let handler = this.custom_execute_handler.clone();
+            let mode = &this.mode;
+            let (mut table, mut actions, operation, operation_id) =
+                this.clone().into_table_and_actions().await?;
 
-            let table_state = if log_store.is_delta_table_location().await? {
+            let table_state = if table.log_store.is_delta_table_location().await? {
                 match mode {
                     SaveMode::ErrorIfExists => return Err(CreateError::TableAlreadyExists.into()),
                     SaveMode::Append => return Err(CreateError::AppendNotAllowed.into()),
@@ -373,9 +380,10 @@ impl std::future::IntoFuture for CreateBuilder {
                 None
             };
 
-            let version = CommitBuilder::default()
+            let version = CommitBuilder::from(this.commit_properties.clone())
                 .with_actions(actions)
-                .with_app_metadata(app_metadata)
+                .with_operation_id(operation_id)
+                .with_post_commit_hook_handler(handler.clone())
                 .build(
                     table_state.map(|f| f as &dyn TableReference),
                     table.log_store.clone(),
@@ -385,6 +393,11 @@ impl std::future::IntoFuture for CreateBuilder {
                 .version();
             table.load_version(version).await?;
 
+            if let Some(handler) = handler {
+                handler
+                    .post_execute(&table.log_store(), operation_id)
+                    .await?;
+            }
             Ok(table)
         })
     }

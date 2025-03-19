@@ -4,28 +4,22 @@ use deltalake::storage::{ListResult, ObjectStore, ObjectStoreError, ObjectStoreR
 use futures::future::{join_all, BoxFuture, FutureExt};
 use futures::StreamExt;
 use pyo3::types::{IntoPyDict, PyAnyMethods, PyModule};
-use pyo3::{Bound, PyAny, PyResult, Python, ToPyObject};
+use pyo3::{Bound, IntoPyObjectExt, PyAny, PyResult, Python};
 use tokio::runtime::Runtime;
 
 #[inline]
 pub fn rt() -> &'static Runtime {
     static TOKIO_RT: OnceLock<Runtime> = OnceLock::new();
     static PID: OnceLock<u32> = OnceLock::new();
-    match PID.get() {
-        Some(pid) if pid == &std::process::id() => {} // Reuse the static runtime.
-        Some(pid) => {
-            panic!(
-                "Forked process detected - current PID is {} but the tokio runtime was created by {}. The tokio \
-                runtime does not support forked processes https://github.com/tokio-rs/tokio/issues/4301. If you are \
-                seeing this message while using Python multithreading make sure to use the `spawn` or `forkserver` \
-                mode.", 
-                pid, std::process::id()
-            );
-        }
-        None => {
-            PID.set(std::process::id())
-                .expect("Failed to record PID for tokio runtime.");
-        }
+    let pid = std::process::id();
+    let runtime_pid = *PID.get_or_init(|| pid);
+    if pid != runtime_pid {
+        panic!(
+            "Forked process detected - current PID is {pid} but the tokio runtime was created by {runtime_pid}. The tokio \
+            runtime does not support forked processes https://github.com/tokio-rs/tokio/issues/4301. If you are \
+            seeing this message while using Python multithreading make sure to use the `spawn` or `forkserver` \
+            mode.", 
+        );
     }
     TOKIO_RT.get_or_init(|| Runtime::new().expect("Failed to create a tokio runtime."))
 }
@@ -106,13 +100,13 @@ pub fn warn<'py>(
     message: &str,
     stack_level: Option<u8>,
 ) -> PyResult<()> {
-    let warnings_warn = PyModule::import_bound(py, "warnings")?.getattr("warn")?;
-    let warning_type = PyModule::import_bound(py, "builtins")?.getattr(warning_type)?;
+    let warnings_warn = PyModule::import(py, "warnings")?.getattr("warn")?;
+    let warning_type = PyModule::import(py, "builtins")?.getattr(warning_type)?;
     let stack_level = stack_level.unwrap_or(1);
     let kwargs: [(&str, Bound<'py, PyAny>); 2] = [
         ("category", warning_type),
-        ("stacklevel", stack_level.to_object(py).into_bound(py)),
+        ("stacklevel", stack_level.into_py_any(py)?.into_bound(py)),
     ];
-    warnings_warn.call((message,), Some(&kwargs.into_py_dict_bound(py)))?;
+    warnings_warn.call((message,), Some(&kwargs.into_py_dict(py)?))?;
     Ok(())
 }

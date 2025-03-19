@@ -72,7 +72,8 @@ impl ScalarExt for Scalar {
             },
             Self::Binary(val) => create_escaped_binary_string(val.as_slice()),
             Self::Null(_) => "null".to_string(),
-            Self::Struct(_) => unimplemented!(),
+            Self::Struct(_) => self.to_string(),
+            Self::Array(_) => self.to_string(),
         }
     }
 
@@ -84,7 +85,7 @@ impl ScalarExt for Scalar {
         encode(Path::from(self.serialize()).as_ref()).to_string()
     }
 
-    /// Create a [`Scalar`] form a row in an arrow array.
+    /// Create a [`Scalar`] from a row in an arrow array.
     fn from_array(arr: &dyn Array, index: usize) -> Option<Self> {
         use arrow_array::*;
         use arrow_schema::DataType::*;
@@ -105,6 +106,10 @@ impl ScalarExt for Scalar {
                 .as_any()
                 .downcast_ref::<LargeStringArray>()
                 .map(|v| Self::String(v.value(index).to_string())),
+            Utf8View => arr
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .map(|v| Self::String(v.value(index).to_string())),
             Boolean => arr
                 .as_any()
                 .downcast_ref::<BooleanArray>()
@@ -120,6 +125,10 @@ impl ScalarExt for Scalar {
             FixedSizeBinary(_) => arr
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
+                .map(|v| Self::Binary(v.value(index).to_vec())),
+            BinaryView => arr
+                .as_any()
+                .downcast_ref::<BinaryViewArray>()
                 .map(|v| Self::Binary(v.value(index).to_vec())),
             Int8 => arr
                 .as_any()
@@ -216,8 +225,6 @@ impl ScalarExt for Scalar {
             | Dictionary(_, _)
             | RunEndEncoded(_, _)
             | Union(_, _)
-            | Utf8View
-            | BinaryView
             | ListView(_)
             | LargeListView(_)
             | Null => None,
@@ -269,6 +276,7 @@ impl ScalarExt for Scalar {
             Self::Binary(val) => Value::String(create_escaped_binary_string(val.as_slice())),
             Self::Null(_) => Value::Null,
             Self::Struct(_) => unimplemented!(),
+            Self::Array(_) => unimplemented!(),
         }
     }
 }
@@ -277,7 +285,7 @@ fn create_escaped_binary_string(data: &[u8]) -> String {
     let mut escaped_string = String::new();
     for &byte in data {
         // Convert each byte to its two-digit hexadecimal representation
-        let hex_representation = format!("{:04X}", byte);
+        let hex_representation = format!("{byte:04X}");
         // Append the hexadecimal representation with an escape sequence
         escaped_string.push_str("\\u");
         escaped_string.push_str(&hex_representation);

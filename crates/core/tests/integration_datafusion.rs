@@ -1,5 +1,5 @@
 #![cfg(feature = "datafusion")]
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,7 +11,6 @@ use arrow_schema::{
     DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit,
 };
 use datafusion::assert_batches_sorted_eq;
-use datafusion::datasource::physical_plan::ParquetExec;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::{SessionContext, SessionState, TaskContext};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -22,11 +21,10 @@ use datafusion_common::ScalarValue::*;
 use datafusion_common::{DataFusionError, Result};
 use datafusion_expr::Expr;
 use datafusion_proto::bytes::{
-    physical_plan_from_bytes_with_extension_codec, physical_plan_to_bytes_with_extension_codec,
+    logical_plan_from_bytes_with_extension_codec, logical_plan_to_bytes_with_extension_codec,
 };
-use deltalake_core::delta_datafusion::{DeltaPhysicalCodec, DeltaScan};
+use deltalake_core::delta_datafusion::DeltaScan;
 use deltalake_core::kernel::{DataType, MapType, PrimitiveType, StructField, StructType};
-use deltalake_core::logstore::logstore_for;
 use deltalake_core::operations::create::CreateBuilder;
 use deltalake_core::protocol::SaveMode;
 use deltalake_core::writer::{DeltaWriter, RecordBatchWriter};
@@ -41,8 +39,13 @@ use serial_test::serial;
 use url::Url;
 
 mod local {
-    use datafusion::common::stats::Precision;
-    use deltalake_core::{logstore::default_logstore, writer::JsonWriter};
+    use datafusion::datasource::source::DataSourceExec;
+    use datafusion::{common::stats::Precision, datasource::provider_as_source};
+    use datafusion_expr::LogicalPlanBuilder;
+    use deltalake_core::{
+        delta_datafusion::DeltaLogicalCodec, logstore::default_logstore, writer::JsonWriter,
+    };
+    use itertools::Itertools;
     use object_store::local::LocalFileSystem;
 
     use super::*;
@@ -82,7 +85,7 @@ mod local {
             &mut self,
             plan: &dyn ExecutionPlan,
         ) -> std::result::Result<bool, Self::Error> {
-            if let Some(exec) = plan.as_any().downcast_ref::<ParquetExec>() {
+            if let Some(exec) = plan.as_any().downcast_ref::<DataSourceExec>() {
                 let files = get_scanned_files(exec);
                 self.scanned_files.extend(files);
             } else if let Some(exec) = plan.as_any().downcast_ref::<DeltaScan>() {
@@ -191,59 +194,33 @@ mod local {
         // We want to emulate that this occurs on another node, so that all we have access to is the
         // plan byte serialization.
         let source_scan_bytes = {
-            let ctx = SessionContext::new();
-            let state = ctx.state();
             let source_table = open_table("../test/tests/data/delta-0.8.0-date").await?;
-            let source_scan = source_table.scan(&state, None, &[], None).await?;
-            physical_plan_to_bytes_with_extension_codec(source_scan, &DeltaPhysicalCodec {})?
+
+            let target_provider = provider_as_source(Arc::new(source_table));
+            let source =
+                LogicalPlanBuilder::scan("source", target_provider.clone(), None)?.build()?;
+            // We don't want to verify the predicate against existing data
+            logical_plan_to_bytes_with_extension_codec(&source, &DeltaLogicalCodec {})?
         };
 
         // Build a new context from scratch and deserialize the plan
         let ctx = SessionContext::new();
         let state = ctx.state();
-        let source_scan = physical_plan_from_bytes_with_extension_codec(
+        let source_scan = Arc::new(logical_plan_from_bytes_with_extension_codec(
             &source_scan_bytes,
             &ctx,
-            &DeltaPhysicalCodec {},
-        )?;
-        let schema = StructType::try_from(source_scan.schema()).unwrap();
+            &DeltaLogicalCodec {},
+        )?);
+        let schema = StructType::try_from(source_scan.schema().as_arrow()).unwrap();
         let fields = schema.fields().cloned();
 
+        dbg!(schema.fields().collect_vec().clone());
         // Create target Delta Table
         let target_table = CreateBuilder::new()
             .with_location("memory:///target")
             .with_columns(fields)
             .with_table_name("target")
             .await?;
-
-        // Trying to execute the write from the input plan without providing Datafusion with a session
-        // state containing the referenced object store in the registry results in an error.
-        assert!(WriteBuilder::new(
-            target_table.log_store(),
-            target_table.snapshot().ok().cloned()
-        )
-        .with_input_execution_plan(source_scan.clone())
-        .await
-        .unwrap_err()
-        .to_string()
-        .contains("No suitable object store found for delta-rs://"));
-
-        // Register the missing source table object store
-        let source_uri = Url::parse(
-            &source_scan
-                .as_any()
-                .downcast_ref::<DeltaScan>()
-                .unwrap()
-                .table_uri
-                .clone(),
-        )
-        .unwrap();
-        let source_store = logstore_for(source_uri, HashMap::new(), None).unwrap();
-        let object_store_url = source_store.object_store_url();
-        let source_store_url: &Url = object_store_url.as_ref();
-        state
-            .runtime_env()
-            .register_object_store(source_store_url, source_store.object_store());
 
         // Execute write to the target table with the proper state
         let target_table = WriteBuilder::new(
@@ -673,7 +650,7 @@ mod local {
             if column == "decimal" || column == "date" || column == "binary" {
                 continue;
             }
-            println!("[Unwrapped] Test Column: {} value: {}", column, file1_value);
+            println!("[Unwrapped] Test Column: {column} value: {file1_value}");
 
             // Equality
             let e = col(column).eq(file1_value.clone());
@@ -775,7 +752,7 @@ mod local {
                 continue;
             }
 
-            println!("[Wrapped] Test Column: {} value: {}", column, file1_value);
+            println!("[Wrapped] Test Column: {column} value: {file1_value}");
 
             let partitions = vec![column.to_owned()];
             let batch = create_all_types_batch(3, 0, 0);
@@ -861,7 +838,7 @@ mod local {
         // Logically this should prune. See above
         let e = col("k").eq(lit("A")).and(col("k").is_not_null());
         let metrics = get_scan_metrics(&table, &state, &[e]).await.unwrap();
-        println!("{:?}", metrics);
+        println!("{metrics:?}");
         assert!(metrics.num_scanned_files() == 1);
 
         let e = col("k").eq(lit("B"));
@@ -1129,17 +1106,18 @@ mod local {
             );
         let tbl = tbl.await.unwrap();
         let ctx = SessionContext::new();
-        let plan = ctx
-            .sql("SELECT 1 as id")
-            .await
-            .unwrap()
-            .create_physical_plan()
-            .await
-            .unwrap();
+        let plan = Arc::new(
+            ctx.sql("SELECT 1 as id")
+                .await
+                .unwrap()
+                .logical_plan()
+                .clone(),
+        );
         let write_builder = WriteBuilder::new(log_store, tbl.state);
         let _ = write_builder
             .with_input_execution_plan(plan)
             .with_save_mode(SaveMode::Overwrite)
+            .with_schema_mode(deltalake_core::operations::write::SchemaMode::Overwrite)
             .await
             .unwrap();
 
@@ -1207,7 +1185,7 @@ async fn simple_query(context: &IntegrationContext) -> TestResult {
 mod date_partitions {
     use super::*;
 
-    async fn setup_test() -> Result<DeltaTable, Box<dyn Error>> {
+    async fn setup_test(table_uri: &str) -> Result<DeltaTable, Box<dyn Error>> {
         let columns = vec![
             StructField::new(
                 "id".to_owned(),
@@ -1221,8 +1199,6 @@ mod date_partitions {
             ),
         ];
 
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let table_uri = tmp_dir.path().to_str().to_owned().unwrap();
         let dt = DeltaOps::try_from_uri(table_uri)
             .await?
             .create()
@@ -1259,7 +1235,9 @@ mod date_partitions {
     #[tokio::test]
     async fn test_issue_1445_date_partition() -> Result<()> {
         let ctx = SessionContext::new();
-        let mut dt = setup_test().await.unwrap();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let table_uri = tmp_dir.path().to_str().to_owned().unwrap();
+        let mut dt = setup_test(table_uri).await.unwrap();
         let mut writer = RecordBatchWriter::for_table(&dt)?;
         write(
             &mut writer,

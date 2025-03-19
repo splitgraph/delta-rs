@@ -2,11 +2,9 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{
-    Array, Int32Array, Int64Array, MapArray, RecordBatch, StringArray, StructArray, UInt64Array,
-};
+use arrow_array::{Array, Int32Array, Int64Array, MapArray, RecordBatch, StringArray, StructArray};
 use chrono::{DateTime, Utc};
-use delta_kernel::expressions::Scalar;
+use delta_kernel::expressions::{Scalar, StructData};
 use indexmap::IndexMap;
 use object_store::path::Path;
 use object_store::ObjectMeta;
@@ -15,7 +13,7 @@ use percent_encoding::percent_decode_str;
 use super::super::scalars::ScalarExt;
 use crate::kernel::arrow::extract::{extract_and_cast, extract_and_cast_opt};
 use crate::kernel::{
-    DataType, DeletionVectorDescriptor, Metadata, Remove, StructField, StructType,
+    Add, DataType, DeletionVectorDescriptor, Metadata, Remove, StructField, StructType,
 };
 use crate::{DeltaResult, DeltaTableError};
 
@@ -81,7 +79,7 @@ pub struct DeletionVectorView<'a> {
     index: usize,
 }
 
-impl<'a> DeletionVectorView<'a> {
+impl DeletionVectorView<'_> {
     /// get a unique idenitfier for the deletion vector
     pub fn unique_id(&self) -> String {
         if let Some(offset) = self.offset() {
@@ -160,7 +158,7 @@ impl LogicalFile<'_> {
     /// An object store [`Path`] to the file.
     ///
     /// this tries to parse the file string and if that fails, it will return the string as is.
-    // TODO assert consisent handling of the paths encoding when reading log data so this logic can be removed.
+    // TODO assert consistent handling of the paths encoding when reading log data so this logic can be removed.
     pub fn object_store_path(&self) -> Path {
         let path = self.path();
         // Try to preserve percent encoding if possible
@@ -278,12 +276,60 @@ impl LogicalFile<'_> {
             .column_by_name(COL_MIN_VALUES)
             .and_then(|c| Scalar::from_array(c.as_ref(), self.index))
     }
-
     /// Struct containing all available max values for the columns in this file.
     pub fn max_values(&self) -> Option<Scalar> {
+        // With delta.checkpoint.writeStatsAsStruct the microsecond timestamps are truncated to ms as defined by protocol
+        // this basically implies that it's floored when we parse_stats on the fly they are not truncated
+        // to tackle this we always round upwards by 1ms
+        fn ceil_datetime(v: i64) -> i64 {
+            let remainder = v % 1000;
+            if remainder == 0 {
+                // if nanoseconds precision remainder is 0, we assume it was truncated
+                // else we use the exact stats
+                ((v as f64 / 1000.0).floor() as i64 + 1) * 1000
+            } else {
+                v
+            }
+        }
+
         self.stats
             .column_by_name(COL_MAX_VALUES)
             .and_then(|c| Scalar::from_array(c.as_ref(), self.index))
+            .map(|s| round_ms_datetimes(s, &ceil_datetime))
+    }
+
+    pub fn add_action(&self) -> Add {
+        Add {
+            path: self.path().to_string(),
+            partition_values: self
+                .partition_values()
+                .ok()
+                .map(|pv| {
+                    pv.iter()
+                        .map(|(k, v)| {
+                            (
+                                k.to_string(),
+                                if v.is_null() {
+                                    None
+                                } else {
+                                    Some(v.serialize())
+                                },
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            size: self.size(),
+            modification_time: self.modification_time(),
+            data_change: true,
+            stats: Scalar::from_array(self.stats as &dyn Array, self.index).map(|s| s.serialize()),
+            tags: None,
+            deletion_vector: self.deletion_vector().map(|dv| dv.descriptor()),
+            base_row_id: None,
+            default_row_commit_version: None,
+            clustering_provider: None,
+            stats_parsed: None,
+        }
     }
 
     /// Create a remove action for this logical file.
@@ -314,6 +360,28 @@ impl LogicalFile<'_> {
             base_row_id: None,
             default_row_commit_version: None,
         }
+    }
+}
+
+fn round_ms_datetimes<F>(value: Scalar, func: &F) -> Scalar
+where
+    F: Fn(i64) -> i64,
+{
+    match value {
+        Scalar::Timestamp(v) => Scalar::Timestamp(func(v)),
+        Scalar::TimestampNtz(v) => Scalar::TimestampNtz(func(v)),
+        Scalar::Struct(struct_data) => {
+            let mut fields = Vec::new();
+            let mut scalars = Vec::new();
+
+            for (field, value) in struct_data.fields().iter().zip(struct_data.values().iter()) {
+                fields.push(field.clone());
+                scalars.push(round_ms_datetimes(value.clone(), func));
+            }
+            let data = StructData::try_new(fields, scalars).unwrap();
+            Scalar::Struct(data)
+        }
+        value => value,
     }
 }
 
@@ -373,18 +441,23 @@ impl<'a> FileStatsAccessor<'a> {
         );
         let deletion_vector = extract_and_cast_opt::<StructArray>(data, "add.deletionVector");
         let deletion_vector = deletion_vector.and_then(|dv| {
-            let storage_type = extract_and_cast::<StringArray>(dv, "storageType").ok()?;
-            let path_or_inline_dv = extract_and_cast::<StringArray>(dv, "pathOrInlineDv").ok()?;
-            let size_in_bytes = extract_and_cast::<Int32Array>(dv, "sizeInBytes").ok()?;
-            let cardinality = extract_and_cast::<Int64Array>(dv, "cardinality").ok()?;
-            let offset = extract_and_cast_opt::<Int32Array>(dv, "offset");
-            Some(DeletionVector {
-                storage_type,
-                path_or_inline_dv,
-                size_in_bytes,
-                cardinality,
-                offset,
-            })
+            if dv.null_count() == dv.len() {
+                None
+            } else {
+                let storage_type = extract_and_cast::<StringArray>(dv, "storageType").ok()?;
+                let path_or_inline_dv =
+                    extract_and_cast::<StringArray>(dv, "pathOrInlineDv").ok()?;
+                let size_in_bytes = extract_and_cast::<Int32Array>(dv, "sizeInBytes").ok()?;
+                let cardinality = extract_and_cast::<Int64Array>(dv, "cardinality").ok()?;
+                let offset = extract_and_cast_opt::<Int32Array>(dv, "offset");
+                Some(DeletionVector {
+                    storage_type,
+                    path_or_inline_dv,
+                    size_in_bytes,
+                    cardinality,
+                    offset,
+                })
+            }
         });
 
         Ok(Self {
@@ -403,8 +476,8 @@ impl<'a> FileStatsAccessor<'a> {
     pub(crate) fn get(&self, index: usize) -> DeltaResult<LogicalFile<'a>> {
         if index >= self.length {
             return Err(DeltaTableError::Generic(format!(
-                "index out of bounds: {} >= {}",
-                index, self.length
+                "index out of bounds: {index} >= {}",
+                self.length,
             )));
         }
         Ok(LogicalFile {
@@ -477,14 +550,14 @@ impl<'a> IntoIterator for LogDataHandler<'a> {
 #[cfg(feature = "datafusion")]
 mod datafusion {
     use std::collections::HashSet;
-    use std::sync::Arc;
+    use std::sync::{Arc, LazyLock};
 
     use ::datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
     use ::datafusion::physical_optimizer::pruning::PruningStatistics;
     use ::datafusion::physical_plan::Accumulator;
     use arrow::compute::concat_batches;
     use arrow_arith::aggregate::sum;
-    use arrow_array::{ArrayRef, BooleanArray, Int64Array};
+    use arrow_array::{ArrayRef, BooleanArray, Int64Array, UInt64Array};
     use arrow_schema::DataType as ArrowDataType;
     use datafusion_common::scalar::ScalarValue;
     use datafusion_common::stats::{ColumnStatistics, Precision, Statistics};
@@ -511,7 +584,9 @@ mod datafusion {
         fn collect_count(&self, name: &str) -> Precision<usize> {
             let num_records = extract_and_cast_opt::<Int64Array>(self.stats, name);
             if let Some(num_records) = num_records {
-                if let Some(null_count_mulls) = num_records.nulls() {
+                if num_records.is_empty() {
+                    Precision::Exact(0)
+                } else if let Some(null_count_mulls) = num_records.nulls() {
                     if null_count_mulls.null_count() > 0 {
                         Precision::Absent
                     } else {
@@ -564,32 +639,30 @@ mod datafusion {
             }
 
             match array.data_type() {
-                ArrowDataType::Struct(fields) => {
-                    return fields
-                        .iter()
-                        .map(|f| {
-                            self.column_bounds(
-                                path_step,
-                                &format!("{name}.{}", f.name()),
-                                fun_type.clone(),
-                            )
-                        })
-                        .map(|s| match s {
-                            Precision::Exact(s) => Some(s),
-                            _ => None,
-                        })
-                        .collect::<Option<Vec<_>>>()
-                        .map(|o| {
-                            let arrays = o
-                                .into_iter()
-                                .map(|sv| sv.to_array())
-                                .collect::<Result<Vec<_>, datafusion_common::DataFusionError>>()
-                                .unwrap();
-                            let sa = StructArray::new(fields.clone(), arrays, None);
-                            Precision::Exact(ScalarValue::Struct(Arc::new(sa)))
-                        })
-                        .unwrap_or(Precision::Absent);
-                }
+                ArrowDataType::Struct(fields) => fields
+                    .iter()
+                    .map(|f| {
+                        self.column_bounds(
+                            path_step,
+                            &format!("{name}.{}", f.name()),
+                            fun_type.clone(),
+                        )
+                    })
+                    .map(|s| match s {
+                        Precision::Exact(s) => Some(s),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()
+                    .map(|o| {
+                        let arrays = o
+                            .into_iter()
+                            .map(|sv| sv.to_array())
+                            .collect::<Result<Vec<_>, datafusion_common::DataFusionError>>()
+                            .unwrap();
+                        let sa = StructArray::new(fields.clone(), arrays, None);
+                        Precision::Exact(ScalarValue::Struct(Arc::new(sa)))
+                    })
+                    .unwrap_or(Precision::Absent),
                 _ => Precision::Absent,
             }
         }
@@ -635,6 +708,7 @@ mod datafusion {
                 null_count,
                 max_value,
                 min_value,
+                sum_value: Precision::Absent,
                 distinct_count: Precision::Absent,
             })
         }
@@ -650,6 +724,7 @@ mod datafusion {
                 null_count: self.null_count.add(&other.null_count),
                 max_value: self.max_value.max(&other.max_value),
                 min_value: self.min_value.min(&other.min_value),
+                sum_value: Precision::Absent,
                 distinct_count: self.distinct_count.add(&other.distinct_count),
             }
         }
@@ -716,9 +791,9 @@ mod datafusion {
                 return None;
             }
             let expression = if self.metadata.partition_columns.contains(&column.name) {
-                Expression::Column(format!("add.partitionValues_parsed.{}", column.name))
+                Expression::column(["add", "partitionValues_parsed", &column.name])
             } else {
-                Expression::Column(format!("add.stats_parsed.{}.{}", stats_field, column.name))
+                Expression::column(["add", "stats_parsed", stats_field, &column.name])
             };
             let evaluator = ARROW_HANDLER.get_evaluator(
                 crate::kernel::models::fields::log_schema_ref().clone(),
@@ -730,7 +805,7 @@ mod datafusion {
                 let engine = ArrowEngineData::new(batch.clone());
                 let result = evaluator.evaluate(&engine).ok()?;
                 let result = result
-                    .as_any()
+                    .any_ref()
                     .downcast_ref::<ArrowEngineData>()
                     .ok_or(DeltaTableError::generic(
                         "failed to downcast evaluator result to ArrowEngineData.",
@@ -739,11 +814,11 @@ mod datafusion {
                 results.push(result.record_batch().clone());
             }
             let batch = concat_batches(results[0].schema_ref(), &results).ok()?;
-            batch.column_by_name("output").map(|c| c.clone())
+            batch.column_by_name("output").cloned()
         }
     }
 
-    impl<'a> PruningStatistics for LogDataHandler<'a> {
+    impl PruningStatistics for LogDataHandler<'_> {
         /// return the minimum values for the named column, if known.
         /// Note: the returned array must contain `num_containers()` rows
         fn min_values(&self, column: &Column) -> Option<ArrayRef> {
@@ -791,19 +866,20 @@ mod datafusion {
         ///
         /// Note: the returned array must contain `num_containers()` rows
         fn row_counts(&self, _column: &Column) -> Option<ArrayRef> {
-            lazy_static::lazy_static! {
-                static ref ROW_COUNTS_EVAL: Arc<dyn ExpressionEvaluator> =  ARROW_HANDLER.get_evaluator(
+            static ROW_COUNTS_EVAL: LazyLock<Arc<dyn ExpressionEvaluator>> = LazyLock::new(|| {
+                ARROW_HANDLER.get_evaluator(
                     crate::kernel::models::fields::log_schema_ref().clone(),
-                    Expression::column("add.stats_parsed.numRecords"),
+                    Expression::column(["add", "stats_parsed", "numRecords"]),
                     DataType::Primitive(PrimitiveType::Long),
-                );
-            }
+                )
+            });
+
             let mut results = Vec::with_capacity(self.data.len());
             for batch in self.data.iter() {
                 let engine = ArrowEngineData::new(batch.clone());
                 let result = ROW_COUNTS_EVAL.evaluate(&engine).ok()?;
                 let result = result
-                    .as_any()
+                    .any_ref()
                     .downcast_ref::<ArrowEngineData>()
                     .ok_or(DeltaTableError::generic(
                         "failed to downcast evaluator result to ArrowEngineData.",
@@ -887,6 +963,6 @@ mod tests {
             .log_data();
 
         let col_stats = file_stats.statistics();
-        println!("{:?}", col_stats);
+        println!("{col_stats:?}");
     }
 }

@@ -1,12 +1,11 @@
 use std::cmp::Ordering;
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow_array::RecordBatch;
 use chrono::Utc;
 use futures::{stream::BoxStream, StreamExt, TryStreamExt};
 use itertools::Itertools;
-use lazy_static::lazy_static;
 use object_store::path::Path;
 use object_store::{Error as ObjectStoreError, ObjectMeta, ObjectStore};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
@@ -24,13 +23,19 @@ use crate::{DeltaResult, DeltaTableConfig, DeltaTableError};
 
 const LAST_CHECKPOINT_FILE_NAME: &str = "_last_checkpoint";
 
-lazy_static! {
-    static ref CHECKPOINT_FILE_PATTERN: Regex =
-        Regex::new(r"\d+\.checkpoint(\.\d+\.\d+)?\.parquet").unwrap();
-    static ref DELTA_FILE_PATTERN: Regex = Regex::new(r"^\d+\.json$").unwrap();
-    pub(super) static ref TOMBSTONE_SCHEMA: StructType =
-        StructType::new(vec![ActionType::Remove.schema_field().clone(),]);
-}
+static CHECKPOINT_FILE_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\d+\.checkpoint(\.\d+\.\d+)?\.parquet").unwrap());
+static DELTA_FILE_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d+\.json$").unwrap());
+static CRC_FILE_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(\.\d+(\.crc|\.json)|\d+)\.crc$").unwrap());
+static LAST_CHECKPOINT_FILE_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^_last_checkpoint$").unwrap());
+static LAST_VACUUM_INFO_FILE_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^_last_vacuum_info$").unwrap());
+static DELETION_VECTOR_FILE_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r".*\.bin$").unwrap());
+pub(super) static TOMBSTONE_SCHEMA: LazyLock<StructType> =
+    LazyLock::new(|| StructType::new(vec![ActionType::Remove.schema_field().clone()]));
 
 /// Trait to extend a file path representation with delta specific functionality
 ///
@@ -38,7 +43,6 @@ lazy_static! {
 /// parse the version number from a log file path
 // TODO handle compaction files
 pub(crate) trait PathExt {
-    fn child(&self, path: impl AsRef<str>) -> DeltaResult<Path>;
     /// Returns the last path segment if not terminated with a "/"
     fn filename(&self) -> Option<&str>;
 
@@ -62,13 +66,33 @@ pub(crate) trait PathExt {
             .map(|name| DELTA_FILE_PATTERN.captures(name).is_some())
             .unwrap_or(false)
     }
+
+    fn is_crc_file(&self) -> bool {
+        self.filename()
+            .map(|name| CRC_FILE_PATTERN.captures(name).is_some())
+            .unwrap()
+    }
+
+    fn is_last_checkpoint_file(&self) -> bool {
+        self.filename()
+            .map(|name| LAST_CHECKPOINT_FILE_PATTERN.captures(name).is_some())
+            .unwrap_or(false)
+    }
+
+    fn is_last_vacuum_info_file(&self) -> bool {
+        self.filename()
+            .map(|name| LAST_VACUUM_INFO_FILE_PATTERN.captures(name).is_some())
+            .unwrap_or(false)
+    }
+
+    fn is_deletion_vector_file(&self) -> bool {
+        self.filename()
+            .map(|name| DELETION_VECTOR_FILE_PATTERN.captures(name).is_some())
+            .unwrap_or(false)
+    }
 }
 
 impl PathExt for Path {
-    fn child(&self, path: impl AsRef<str>) -> DeltaResult<Path> {
-        Ok(self.child(path.as_ref()))
-    }
-
     fn filename(&self) -> Option<&str> {
         self.filename()
     }
@@ -134,7 +158,7 @@ impl LogSegment {
 
     /// Try to create a new [`LogSegment`] from a slice of the log.
     ///
-    /// Ths will create a new [`LogSegment`] from the log with all relevant log files
+    /// This will create a new [`LogSegment`] from the log with all relevant log files
     /// starting at `start_version` and ending at `end_version`.
     pub async fn try_new_slice(
         table_root: &Path,
@@ -142,14 +166,11 @@ impl LogSegment {
         end_version: Option<i64>,
         log_store: &dyn LogStore,
     ) -> DeltaResult<Self> {
-        debug!(
-            "try_new_slice: start_version: {}, end_version: {:?}",
-            start_version, end_version
-        );
+        debug!("try_new_slice: start_version: {start_version}, end_version: {end_version:?}",);
         log_store.refresh().await?;
         let log_url = table_root.child("_delta_log");
         let (mut commit_files, checkpoint_files) = list_log_files(
-            log_store.object_store().as_ref(),
+            log_store.object_store(None).as_ref(),
             &log_url,
             end_version,
             Some(start_version),
@@ -188,7 +209,7 @@ impl LogSegment {
         Ok(())
     }
 
-    /// Returns the highes commit version number in the log segment
+    /// Returns the highest commit version number in the log segment
     pub fn file_version(&self) -> Option<i64> {
         self.commit_files
             .iter()
@@ -304,12 +325,12 @@ impl LogSegment {
         store: Arc<dyn ObjectStore>,
         config: &DeltaTableConfig,
     ) -> DeltaResult<(Option<Protocol>, Option<Metadata>)> {
-        lazy_static::lazy_static! {
-            static ref READ_SCHEMA: StructType = StructType::new(vec![
+        static READ_SCHEMA: LazyLock<StructType> = LazyLock::new(|| {
+            StructType::new(vec![
                 ActionType::Protocol.schema_field().clone(),
                 ActionType::Metadata.schema_field().clone(),
-            ]);
-        }
+            ])
+        });
 
         let mut maybe_protocol = None;
         let mut maybe_metadata = None;
@@ -356,7 +377,7 @@ impl LogSegment {
     /// Advance the log segment with new commits
     ///
     /// Returns an iterator over record batches, as if the commits were read from the log.
-    /// The input commits should be in order in which they would be commited to the table.
+    /// The input commits should be in order in which they would be committed to the table.
     pub(super) fn advance<'a>(
         &mut self,
         commits: impl IntoIterator<Item = &'a CommitData>,
@@ -538,7 +559,9 @@ pub(super) async fn list_log_files(
 
 #[cfg(test)]
 pub(super) mod tests {
+    use delta_kernel::table_features::{ReaderFeatures, WriterFeatures};
     use deltalake_test::utils::*;
+    use maplit::hashset;
     use tokio::task::JoinHandle;
 
     use crate::{
@@ -563,7 +586,7 @@ pub(super) mod tests {
         let store = context
             .table_builder(TestTables::Simple)
             .build_storage()?
-            .object_store();
+            .object_store(None);
 
         let segment = LogSegment::try_new(&Path::default(), None, store.as_ref()).await?;
         let bytes = serde_json::to_vec(&segment).unwrap();
@@ -582,7 +605,7 @@ pub(super) mod tests {
         let store = context
             .table_builder(TestTables::SimpleWithCheckpoint)
             .build_storage()?
-            .object_store();
+            .object_store(None);
 
         let log_path = Path::from("_delta_log");
         let cp = read_last_checkpoint(store.as_ref(), &log_path)
@@ -615,7 +638,7 @@ pub(super) mod tests {
         let store = context
             .table_builder(TestTables::Simple)
             .build_storage()?
-            .object_store();
+            .object_store(None);
 
         let (log, check) = list_log_files(store.as_ref(), &log_path, None, None).await?;
         assert_eq!(log.len(), 5);
@@ -632,7 +655,7 @@ pub(super) mod tests {
         let store = context
             .table_builder(TestTables::WithDvSmall)
             .build_storage()?
-            .object_store();
+            .object_store(None);
         let segment = LogSegment::try_new(&Path::default(), None, store.as_ref()).await?;
         let (protocol, _metadata) = segment
             .read_metadata(store.clone(), &Default::default())
@@ -642,8 +665,8 @@ pub(super) mod tests {
         let expected = Protocol {
             min_reader_version: 3,
             min_writer_version: 7,
-            reader_features: Some(vec!["deletionVectors".into()].into_iter().collect()),
-            writer_features: Some(vec!["deletionVectors".into()].into_iter().collect()),
+            reader_features: Some(hashset! {ReaderFeatures::DeletionVectors}),
+            writer_features: Some(hashset! {WriterFeatures::DeletionVectors}),
         };
         assert_eq!(protocol, expected);
 
@@ -661,7 +684,7 @@ pub(super) mod tests {
         let store = context
             .table_builder(TestTables::LatestNotCheckpointed)
             .build_storage()?
-            .object_store();
+            .object_store(None);
         let slow_list_store = Arc::new(slow_store::SlowListStore { store });
 
         let version = table_to_checkpoint.version();
@@ -676,6 +699,7 @@ pub(super) mod tests {
             &table_to_checkpoint.table_uri(),
             version,
             Some(false),
+            None,
         )
         .await?;
 
@@ -784,7 +808,7 @@ pub(super) mod tests {
         let mut actions = vec![Action::Metadata(metadata), Action::Protocol(protocol)];
         for i in 0..10 {
             actions.push(Action::Add(Add {
-                path: format!("part-{}.parquet", i),
+                path: format!("part-{i}.parquet"),
                 modification_time: chrono::Utc::now().timestamp_millis(),
                 ..Default::default()
             }));
@@ -808,7 +832,7 @@ pub(super) mod tests {
         // remove all but one file
         for i in 0..9 {
             actions.push(Action::Remove(Remove {
-                path: format!("part-{}.parquet", i),
+                path: format!("part-{i}.parquet"),
                 deletion_timestamp: Some(chrono::Utc::now().timestamp_millis()),
                 ..Default::default()
             }))
@@ -822,19 +846,23 @@ pub(super) mod tests {
             .await
             .unwrap();
 
-        create_checkpoint_for(commit.version, &commit.snapshot, log_store.as_ref())
+        create_checkpoint_for(commit.version, &commit.snapshot, log_store.as_ref(), None)
             .await
             .unwrap();
+
+        assert_eq!(commit.metrics.num_retries, 0);
+        assert_eq!(commit.metrics.num_log_files_cleaned_up, 0);
+        assert!(!commit.metrics.new_checkpoint_created);
 
         let batches = LogSegment::try_new(
             &Path::default(),
             Some(commit.version),
-            log_store.object_store().as_ref(),
+            log_store.object_store(None).as_ref(),
         )
         .await
         .unwrap()
         .checkpoint_stream(
-            log_store.object_store(),
+            log_store.object_store(None),
             &StructType::new(vec![
                 ActionType::Metadata.schema_field().clone(),
                 ActionType::Protocol.schema_field().clone(),

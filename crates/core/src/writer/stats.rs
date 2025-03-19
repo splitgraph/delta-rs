@@ -1,4 +1,5 @@
 use std::cmp::min;
+use std::ops::Not;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, ops::AddAssign};
@@ -6,6 +7,7 @@ use std::{collections::HashMap, ops::AddAssign};
 use delta_kernel::expressions::Scalar;
 use indexmap::IndexMap;
 use itertools::Itertools;
+use parquet::basic::Type;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::format::FileMetaData;
 use parquet::schema::types::{ColumnDescriptor, SchemaDescriptor};
@@ -14,6 +16,7 @@ use parquet::{
     file::{metadata::RowGroupMetaData, statistics::Statistics},
     format::TimeUnit,
 };
+use tracing::warn;
 
 use super::*;
 use crate::kernel::{scalars::ScalarExt, Add};
@@ -26,7 +29,7 @@ pub fn create_add(
     size: i64,
     file_metadata: &FileMetaData,
     num_indexed_cols: i32,
-    stats_columns: &Option<Vec<String>>,
+    stats_columns: &Option<Vec<impl AsRef<str>>>,
 ) -> Result<Add, DeltaTableError> {
     let stats = stats_from_file_metadata(
         partition_values,
@@ -99,7 +102,7 @@ fn stats_from_file_metadata(
     partition_values: &IndexMap<String, Scalar>,
     file_metadata: &FileMetaData,
     num_indexed_cols: i32,
-    stats_columns: &Option<Vec<String>>,
+    stats_columns: &Option<Vec<impl AsRef<str>>>,
 ) -> Result<Stats, DeltaWriterError> {
     let type_ptr = parquet::schema::types::from_thrift(file_metadata.schema.as_slice());
     let schema_descriptor = type_ptr.map(|type_| Arc::new(SchemaDescriptor::new(type_)))?;
@@ -126,7 +129,7 @@ fn stats_from_metadata(
     row_group_metadata: Vec<RowGroupMetaData>,
     num_rows: i64,
     num_indexed_cols: i32,
-    stats_columns: &Option<Vec<String>>,
+    stats_columns: &Option<Vec<impl AsRef<str>>>,
 ) -> Result<Stats, DeltaWriterError> {
     let mut min_values: HashMap<String, ColumnValueStat> = HashMap::new();
     let mut max_values: HashMap<String, ColumnValueStat> = HashMap::new();
@@ -135,21 +138,19 @@ fn stats_from_metadata(
 
     let idx_to_iterate = if let Some(stats_cols) = stats_columns {
         let stats_cols = stats_cols
-            .into_iter()
+            .iter()
             .map(|v| {
                 match sqlparser::parser::Parser::new(&dialect)
-                    .try_with_sql(v)
+                    .try_with_sql(v.as_ref())
                     .map_err(|e| DeltaTableError::generic(e.to_string()))?
                     .parse_multipart_identifier()
                 {
                     Ok(parts) => Ok(parts.into_iter().map(|v| v.value).join(".")),
-                    Err(e) => {
-                        return Err(DeltaWriterError::DeltaTable(
-                            DeltaTableError::GenericError {
-                                source: Box::new(e),
-                            },
-                        ))
-                    }
+                    Err(e) => Err(DeltaWriterError::DeltaTable(
+                        DeltaTableError::GenericError {
+                            source: Box::new(e),
+                        },
+                    )),
                 }
             })
             .collect::<Result<Vec<String>, DeltaWriterError>>()?;
@@ -189,19 +190,25 @@ fn stats_from_metadata(
 
         let maybe_stats: Option<AggregatedStats> = row_group_metadata
             .iter()
-            .map(|g| {
-                g.column(idx)
-                    .statistics()
-                    .map(|s| AggregatedStats::from((s, &column_descr.logical_type())))
+            .flat_map(|g| {
+                g.column(idx).statistics().into_iter().filter_map(|s| {
+                    let is_binary = matches!(&column_descr.physical_type(), Type::BYTE_ARRAY)
+                        && matches!(column_descr.logical_type(), Some(LogicalType::String)).not();
+                    if is_binary {
+                        warn!(
+                            "Skipping column {} because it's a binary field.",
+                            &column_descr.name().to_string()
+                        );
+                        None
+                    } else {
+                        Some(AggregatedStats::from((s, &column_descr.logical_type())))
+                    }
+                })
             })
-            .reduce(|left, right| match (left, right) {
-                (Some(mut left), Some(right)) => {
-                    left += right;
-                    Some(left)
-                }
-                _ => None,
-            })
-            .flatten();
+            .reduce(|mut left, right| {
+                left += right;
+                left
+            });
 
         if let Some(stats) = maybe_stats {
             apply_min_max_for_column(
@@ -252,9 +259,9 @@ impl StatsScalar {
         macro_rules! get_stat {
             ($val: expr) => {
                 if use_min {
-                    *$val.min()
+                    *$val.min_opt().unwrap()
                 } else {
-                    *$val.max()
+                    *$val.max_opt().unwrap()
                 }
             };
         }
@@ -304,10 +311,11 @@ impl StatsScalar {
             (Statistics::Double(v), _) => Ok(Self::Float64(get_stat!(v))),
             (Statistics::ByteArray(v), logical_type) => {
                 let bytes = if use_min {
-                    v.min_bytes()
+                    v.min_bytes_opt()
                 } else {
-                    v.max_bytes()
-                };
+                    v.max_bytes_opt()
+                }
+                .unwrap_or_default();
                 match logical_type {
                     None => Ok(Self::Bytes(bytes.to_vec())),
                     Some(LogicalType::String) => {
@@ -326,10 +334,11 @@ impl StatsScalar {
             }
             (Statistics::FixedLenByteArray(v), Some(LogicalType::Decimal { scale, precision })) => {
                 let val = if use_min {
-                    v.min_bytes()
+                    v.min_bytes_opt()
                 } else {
-                    v.max_bytes()
-                };
+                    v.max_bytes_opt()
+                }
+                .unwrap_or_default();
 
                 let val = if val.len() <= 16 {
                     i128::from_be_bytes(sign_extend_be(val)) as f64
@@ -343,15 +352,25 @@ impl StatsScalar {
                     });
                 };
 
-                let val = val / 10.0_f64.powi(*scale);
+                let mut val = val / 10.0_f64.powi(*scale);
+
+                if val.is_normal()
+                    && (val.trunc() as i128).to_string().len() > (precision - scale) as usize
+                {
+                    // For normal values with integer parts that get rounded to a number beyond
+                    // the precision - scale range take the next smaller (by magnitude) value
+                    val = f64::from_bits(val.to_bits() - 1);
+                }
+
                 Ok(Self::Decimal(val))
             }
             (Statistics::FixedLenByteArray(v), Some(LogicalType::Uuid)) => {
                 let val = if use_min {
-                    v.min_bytes()
+                    v.min_bytes_opt()
                 } else {
-                    v.max_bytes()
-                };
+                    v.max_bytes_opt()
+                }
+                .unwrap_or_default();
 
                 if val.len() != 16 {
                     return Err(DeltaWriterError::StatsParsingFailed {
@@ -424,8 +443,8 @@ struct AggregatedStats {
 impl From<(&Statistics, &Option<LogicalType>)> for AggregatedStats {
     fn from(value: (&Statistics, &Option<LogicalType>)) -> Self {
         let (stats, logical_type) = value;
-        let null_count = stats.null_count();
-        if stats.has_min_max_set() {
+        let null_count = stats.null_count_opt().unwrap_or_default();
+        if stats.min_bytes_opt().is_some() && stats.max_bytes_opt().is_some() {
             let min = StatsScalar::try_from_stats(stats, logical_type, true).ok();
             let max = StatsScalar::try_from_stats(stats, logical_type, false).ok();
             Self {
@@ -474,6 +493,10 @@ impl AddAssign for AggregatedStats {
 /// the list and items fields from the path, but also need to handle the
 /// peculiar case where the user named the list field "list" or "item".
 ///
+/// NOTE: As of delta_kernel 0.3.1 the name switched from `item` to `element` to line up with the
+/// parquet spec, see
+/// [here](https://github.com/apache/parquet-format/blob/master/LogicalTypes.md#lists)
+///
 /// For example:
 ///
 /// * ["some_nested_list", "list", "item", "list", "item"] -> "some_nested_list"
@@ -495,9 +518,9 @@ fn get_list_field_name(column_descr: &Arc<ColumnDescriptor>) -> Option<String> {
     while let Some(part) = column_path_parts.pop() {
         match (part.as_str(), lists_seen, items_seen) {
             ("list", seen, _) if seen == max_rep_levels => return Some("list".to_string()),
-            ("item", _, seen) if seen == max_rep_levels => return Some("item".to_string()),
+            ("element", _, seen) if seen == max_rep_levels => return Some("element".to_string()),
             ("list", _, _) => lists_seen += 1,
-            ("item", _, _) => items_seen += 1,
+            ("element", _, _) => items_seen += 1,
             (other, _, _) => return Some(other.to_string()),
         }
     }
@@ -599,13 +622,13 @@ mod tests {
         table::builder::DeltaTableBuilder,
         DeltaTable,
     };
-    use lazy_static::lazy_static;
     use parquet::data_type::{ByteArray, FixedLenByteArray};
     use parquet::file::statistics::ValueStatistics;
     use parquet::{basic::Compression, file::properties::WriterProperties};
     use serde_json::{json, Value};
     use std::collections::HashMap;
     use std::path::Path;
+    use std::sync::LazyLock;
 
     macro_rules! simple_parquet_stat {
         ($variant:expr, $value:expr) => {
@@ -613,7 +636,7 @@ mod tests {
                 Some($value),
                 Some($value),
                 None,
-                0,
+                Some(0),
                 false,
             ))
         };
@@ -739,6 +762,32 @@ mod tests {
             (
                 simple_parquet_stat!(
                     Statistics::FixedLenByteArray,
+                    FixedLenByteArray::from(vec![
+                        75, 59, 76, 168, 90, 134, 196, 122, 9, 138, 34, 63, 255, 255, 255, 255
+                    ])
+                ),
+                Some(LogicalType::Decimal {
+                    scale: 6,
+                    precision: 38,
+                }),
+                Value::from(9.999999999999999e31),
+            ),
+            (
+                simple_parquet_stat!(
+                    Statistics::FixedLenByteArray,
+                    FixedLenByteArray::from(vec![
+                        180, 196, 179, 87, 165, 121, 59, 133, 246, 117, 221, 192, 0, 0, 0, 1
+                    ])
+                ),
+                Some(LogicalType::Decimal {
+                    scale: 6,
+                    precision: 38,
+                }),
+                Value::from(-9.999999999999999e31),
+            ),
+            (
+                simple_parquet_stat!(
+                    Statistics::FixedLenByteArray,
                     FixedLenByteArray::from(
                         [
                             0xc2, 0xe8, 0xc7, 0xf7, 0xd1, 0xf9, 0x4b, 0x49, 0xa5, 0xd9, 0x4b, 0xfe,
@@ -789,9 +838,21 @@ mod tests {
         let mut null_count_keys = vec!["some_list", "some_nested_list"];
         null_count_keys.extend_from_slice(min_max_keys.as_slice());
 
-        assert_eq!(min_max_keys.len(), stats.min_values.len());
-        assert_eq!(min_max_keys.len(), stats.max_values.len());
-        assert_eq!(null_count_keys.len(), stats.null_count.len());
+        assert_eq!(
+            min_max_keys.len(),
+            stats.min_values.len(),
+            "min values don't match"
+        );
+        assert_eq!(
+            min_max_keys.len(),
+            stats.max_values.len(),
+            "max values don't match"
+        );
+        assert_eq!(
+            null_count_keys.len(),
+            stats.null_count.len(),
+            "null counts don't match"
+        );
 
         // assert on min values
         for (k, v) in stats.min_values.iter() {
@@ -820,7 +881,7 @@ mod tests {
                 ("uuid", ColumnValueStat::Value(v)) => {
                     assert_eq!("176c770d-92af-4a21-bf76-5d8c5261d659", v.as_str().unwrap())
                 }
-                _ => panic!("Key should not be present"),
+                k => panic!("Key {k:?} should not be present in min_values"),
             }
         }
 
@@ -851,7 +912,7 @@ mod tests {
                 ("uuid", ColumnValueStat::Value(v)) => {
                     assert_eq!("a98bea04-d119-4f21-8edc-eb218b5849af", v.as_str().unwrap())
                 }
-                _ => panic!("Key should not be present"),
+                k => panic!("Key {k:?} should not be present in max_values"),
             }
         }
 
@@ -878,7 +939,7 @@ mod tests {
                 ("some_nested_list", ColumnCountStat::Value(v)) => assert_eq!(100, *v),
                 ("date", ColumnCountStat::Value(v)) => assert_eq!(0, *v),
                 ("uuid", ColumnCountStat::Value(v)) => assert_eq!(0, *v),
-                _ => panic!("Key should not be present"),
+                k => panic!("Key {k:?} should not be present in null_count"),
             }
         }
     }
@@ -904,8 +965,8 @@ mod tests {
         .unwrap();
     }
 
-    lazy_static! {
-        static ref SCHEMA: Value = json!({
+    static SCHEMA: LazyLock<Value> = LazyLock::new(|| {
+        json!({
             "type": "struct",
             "fields": [
                 {
@@ -983,32 +1044,76 @@ mod tests {
                { "name": "date", "type": "string", "nullable": true, "metadata": {} },
                { "name": "uuid", "type": "string", "nullable": true, "metadata": {} },
             ]
-        });
-        static ref V0_COMMIT: String = {
-            let schema_string = serde_json::to_string(&SCHEMA.clone()).unwrap();
-            let jsons = [
-                json!({
-                    "protocol":{"minReaderVersion":1,"minWriterVersion":2}
-                }),
-                json!({
-                    "metaData": {
-                        "id": "22ef18ba-191c-4c36-a606-3dad5cdf3830",
-                        "format": {
-                            "provider": "parquet", "options": {}
-                        },
-                        "schemaString": schema_string,
-                        "partitionColumns": ["date"], "configuration": {}, "createdTime": 1564524294376i64
-                    }
-                }),
-            ];
+        })
+    });
+    static V0_COMMIT: LazyLock<String> = LazyLock::new(|| {
+        let schema_string = serde_json::to_string(&SCHEMA.clone()).unwrap();
+        let jsons = [
+            json!({
+                "protocol":{"minReaderVersion":1,"minWriterVersion":2}
+            }),
+            json!({
+                "metaData": {
+                    "id": "22ef18ba-191c-4c36-a606-3dad5cdf3830",
+                    "format": {
+                        "provider": "parquet", "options": {}
+                    },
+                    "schemaString": schema_string,
+                    "partitionColumns": ["date"], "configuration": {}, "createdTime": 1564524294376i64
+                }
+            }),
+        ];
 
-            jsons
-                .iter()
-                .map(|j| serde_json::to_string(j).unwrap())
-                .collect::<Vec<String>>()
-                .join("\n")
-        };
-        static ref JSON_ROWS: Vec<Value> = {
+        jsons
+            .iter()
+            .map(|j| serde_json::to_string(j).unwrap())
+            .collect::<Vec<String>>()
+            .join("\n")
+    });
+    static JSON_ROWS: LazyLock<Vec<Value>> = LazyLock::new(|| {
+        std::iter::repeat(json!({
+            "meta": {
+                "kafka": {
+                    "offset": 0,
+                    "partition": 0,
+                    "topic": "some_topic"
+                },
+                "producer": {
+                    "timestamp": "2021-06-22"
+                },
+            },
+            "some_string": "GET",
+            "some_int": 302,
+            "some_bool": true,
+            "some_list": ["a", "b", "c"],
+            "some_nested_list": [[42], [84]],
+            "date": "2021-06-22",
+            "uuid": "176c770d-92af-4a21-bf76-5d8c5261d659",
+        }))
+        .take(100)
+        .chain(
+            std::iter::repeat(json!({
+                "meta": {
+                    "kafka": {
+                        "offset": 100,
+                        "partition": 1,
+                        "topic": "another_topic"
+                    },
+                    "producer": {
+                        "timestamp": "2021-06-22"
+                    },
+                },
+                "some_string": "PUT",
+                "some_int": 400,
+                "some_bool": false,
+                "some_list": ["x", "y", "z"],
+                "some_nested_list": [[42], [84]],
+                "date": "2021-06-22",
+                "uuid": "54f3e867-3f7b-4122-a452-9d74fb4fe1ba",
+            }))
+            .take(100),
+        )
+        .chain(
             std::iter::repeat(json!({
                 "meta": {
                     "kafka": {
@@ -1020,56 +1125,12 @@ mod tests {
                         "timestamp": "2021-06-22"
                     },
                 },
-                "some_string": "GET",
-                "some_int": 302,
-                "some_bool": true,
-                "some_list": ["a", "b", "c"],
-                "some_nested_list": [[42], [84]],
+                "some_nested_list": [[42], null],
                 "date": "2021-06-22",
-                "uuid": "176c770d-92af-4a21-bf76-5d8c5261d659",
+                "uuid": "a98bea04-d119-4f21-8edc-eb218b5849af",
             }))
-            .take(100)
-            .chain(
-                std::iter::repeat(json!({
-                    "meta": {
-                        "kafka": {
-                            "offset": 100,
-                            "partition": 1,
-                            "topic": "another_topic"
-                        },
-                        "producer": {
-                            "timestamp": "2021-06-22"
-                        },
-                    },
-                    "some_string": "PUT",
-                    "some_int": 400,
-                    "some_bool": false,
-                    "some_list": ["x", "y", "z"],
-                    "some_nested_list": [[42], [84]],
-                    "date": "2021-06-22",
-                    "uuid": "54f3e867-3f7b-4122-a452-9d74fb4fe1ba",
-                }))
-                .take(100),
-            )
-            .chain(
-                std::iter::repeat(json!({
-                    "meta": {
-                        "kafka": {
-                            "offset": 0,
-                            "partition": 0,
-                            "topic": "some_topic"
-                        },
-                        "producer": {
-                            "timestamp": "2021-06-22"
-                        },
-                    },
-                    "some_nested_list": [[42], null],
-                    "date": "2021-06-22",
-                    "uuid": "a98bea04-d119-4f21-8edc-eb218b5849af",
-                }))
-                .take(100),
-            )
-            .collect()
-        };
-    }
+            .take(100),
+        )
+        .collect()
+    });
 }

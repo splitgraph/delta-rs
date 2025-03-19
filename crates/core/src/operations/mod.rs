@@ -6,7 +6,11 @@
 //! the operations' behaviors and will return an updated table potentially in conjunction
 //! with a [data stream][datafusion::physical_plan::SendableRecordBatchStream],
 //! if the operation returns data as well.
+use async_trait::async_trait;
 use std::collections::HashMap;
+use std::sync::Arc;
+use update_field_metadata::UpdateFieldMetadataBuilder;
+use uuid::Uuid;
 
 use add_feature::AddTableFeatureBuilder;
 #[cfg(feature = "datafusion")]
@@ -17,6 +21,7 @@ pub use datafusion_physical_plan::common::collect as collect_sendable_stream;
 use self::add_column::AddColumnBuilder;
 use self::create::CreateBuilder;
 use self::filesystem_check::FileSystemCheckBuilder;
+#[cfg(feature = "datafusion")]
 use self::optimize::OptimizeBuilder;
 use self::restore::RestoreBuilder;
 use self::set_tbl_properties::SetTablePropertiesBuilder;
@@ -28,6 +33,7 @@ use self::{
     merge::MergeBuilder, update::UpdateBuilder, write::WriteBuilder,
 };
 use crate::errors::{DeltaResult, DeltaTableError};
+use crate::logstore::LogStoreRef;
 use crate::table::builder::DeltaTableBuilder;
 use crate::DeltaTable;
 
@@ -38,9 +44,9 @@ pub mod convert_to_delta;
 pub mod create;
 pub mod drop_constraints;
 pub mod filesystem_check;
-pub mod optimize;
 pub mod restore;
 pub mod transaction;
+pub mod update_field_metadata;
 pub mod vacuum;
 
 #[cfg(all(feature = "cdf", feature = "datafusion"))]
@@ -55,17 +61,65 @@ mod load;
 pub mod load_cdf;
 #[cfg(feature = "datafusion")]
 pub mod merge;
+#[cfg(feature = "datafusion")]
+pub mod optimize;
 pub mod set_tbl_properties;
 #[cfg(feature = "datafusion")]
 pub mod update;
 #[cfg(feature = "datafusion")]
 pub mod write;
-pub mod writer;
+
+#[async_trait]
+pub trait CustomExecuteHandler: Send + Sync {
+    // Execute arbitrary code at the start of a delta operation
+    async fn pre_execute(&self, log_store: &LogStoreRef, operation_id: Uuid) -> DeltaResult<()>;
+
+    // Execute arbitrary code at the end of a delta operation
+    async fn post_execute(&self, log_store: &LogStoreRef, operation_id: Uuid) -> DeltaResult<()>;
+
+    // Execute arbitrary code at the start of the post commit hook
+    async fn before_post_commit_hook(
+        &self,
+        log_store: &LogStoreRef,
+        file_operation: bool,
+        operation_id: Uuid,
+    ) -> DeltaResult<()>;
+
+    // Execute arbitrary code at the end of the post commit hook
+    async fn after_post_commit_hook(
+        &self,
+        log_store: &LogStoreRef,
+        file_operation: bool,
+        operation_id: Uuid,
+    ) -> DeltaResult<()>;
+}
 
 #[allow(unused)]
 /// The [Operation] trait defines common behaviors that all operations builders
 /// should have consistent
-pub(crate) trait Operation<State>: std::future::IntoFuture {}
+pub(crate) trait Operation<State>: std::future::IntoFuture {
+    fn log_store(&self) -> &LogStoreRef;
+    fn get_custom_execute_handler(&self) -> Option<Arc<dyn CustomExecuteHandler>>;
+    async fn pre_execute(&self, operation_id: Uuid) -> DeltaResult<()> {
+        if let Some(handler) = self.get_custom_execute_handler() {
+            handler.pre_execute(self.log_store(), operation_id).await
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn post_execute(&self, operation_id: Uuid) -> DeltaResult<()> {
+        if let Some(handler) = self.get_custom_execute_handler() {
+            handler.post_execute(self.log_store(), operation_id).await
+        } else {
+            Ok(())
+        }
+    }
+
+    fn get_operation_id(&self) -> uuid::Uuid {
+        Uuid::new_v4()
+    }
+}
 
 /// High level interface for executing commands against a DeltaTable
 pub struct DeltaOps(pub DeltaTable);
@@ -174,6 +228,7 @@ impl DeltaOps {
     }
 
     /// Audit active files with files present on the filesystem
+    #[cfg(feature = "datafusion")]
     #[must_use]
     pub fn optimize<'a>(self) -> OptimizeBuilder<'a> {
         OptimizeBuilder::new(self.0.log_store, self.0.state.unwrap())
@@ -243,6 +298,11 @@ impl DeltaOps {
     /// Add new columns
     pub fn add_columns(self) -> AddColumnBuilder {
         AddColumnBuilder::new(self.0.log_store, self.0.state.unwrap())
+    }
+
+    /// Update field metadata
+    pub fn update_field_metadata(self) -> UpdateFieldMetadataBuilder {
+        UpdateFieldMetadataBuilder::new(self.0.log_store, self.0.state.unwrap())
     }
 }
 
@@ -316,7 +376,7 @@ mod datafusion_utils {
     use crate::{delta_datafusion::expr::parse_predicate_expression, DeltaResult};
 
     /// Used to represent user input of either a Datafusion expression or string expression
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub enum Expression {
         /// Datafusion Expression
         DataFusion(Expr),

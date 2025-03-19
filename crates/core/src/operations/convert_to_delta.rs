@@ -13,8 +13,8 @@ use itertools::Itertools;
 use parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
 use parquet::errors::ParquetError;
 use percent_encoding::percent_decode_str;
-use serde_json::{Map, Value};
 use tracing::debug;
+use uuid::Uuid;
 
 use crate::operations::get_num_idx_cols_and_stats_columns;
 use crate::{
@@ -27,6 +27,9 @@ use crate::{
     writer::stats::stats_from_parquet_metadata,
     DeltaResult, DeltaTable, DeltaTableError, ObjectStoreError, NULL_PARTITION_VALUE_DATA_PATH,
 };
+
+use super::transaction::CommitProperties;
+use super::{CustomExecuteHandler, Operation};
 
 /// Error converting a Parquet table to a Delta table
 #[derive(Debug, thiserror::Error)]
@@ -72,7 +75,7 @@ impl From<Error> for DeltaTableError {
 }
 
 /// The partition strategy used by the Parquet table
-/// Currently only hive-partitioning is supproted for Parquet paths
+/// Currently only hive-partitioning is supported for Parquet paths
 #[non_exhaustive]
 #[derive(Default)]
 pub enum PartitionStrategy {
@@ -88,8 +91,7 @@ impl FromStr for PartitionStrategy {
         match s.to_ascii_lowercase().as_str() {
             "hive" => Ok(PartitionStrategy::Hive),
             _ => Err(DeltaTableError::Generic(format!(
-                "Invalid partition strategy provided {}",
-                s
+                "Invalid partition strategy provided {s}"
             ))),
         }
     }
@@ -106,7 +108,9 @@ pub struct ConvertToDeltaBuilder {
     name: Option<String>,
     comment: Option<String>,
     configuration: HashMap<String, Option<String>>,
-    metadata: Option<Map<String, Value>>,
+    /// Additional information to add to the commit
+    commit_properties: CommitProperties,
+    custom_execute_handler: Option<Arc<dyn CustomExecuteHandler>>,
 }
 
 impl Default for ConvertToDeltaBuilder {
@@ -115,7 +119,16 @@ impl Default for ConvertToDeltaBuilder {
     }
 }
 
-impl super::Operation<()> for ConvertToDeltaBuilder {}
+impl super::Operation<()> for ConvertToDeltaBuilder {
+    fn log_store(&self) -> &LogStoreRef {
+        self.log_store
+            .as_ref()
+            .expect("Log store should be available at this stage.")
+    }
+    fn get_custom_execute_handler(&self) -> Option<Arc<dyn CustomExecuteHandler>> {
+        self.custom_execute_handler.clone()
+    }
+}
 
 impl ConvertToDeltaBuilder {
     /// Create a new [`ConvertToDeltaBuilder`]
@@ -130,7 +143,8 @@ impl ConvertToDeltaBuilder {
             name: None,
             comment: None,
             configuration: Default::default(),
-            metadata: Default::default(),
+            commit_properties: CommitProperties::default(),
+            custom_execute_handler: None,
         }
     }
 
@@ -173,7 +187,7 @@ impl ConvertToDeltaBuilder {
     }
 
     /// Specify the partition strategy of the Parquet table
-    /// Currently only hive-partitioning is supproted for Parquet paths
+    /// Currently only hive-partitioning is supported for Parquet paths
     pub fn with_partition_strategy(mut self, strategy: PartitionStrategy) -> Self {
         self.partition_strategy = strategy;
         self
@@ -220,42 +234,48 @@ impl ConvertToDeltaBuilder {
         self
     }
 
-    /// Append custom (application-specific) metadata to the commit.
-    ///
-    /// This might include provenance information such as an id of the
-    /// user that made the commit or the program that created it.
-    pub fn with_metadata(mut self, metadata: Map<String, Value>) -> Self {
-        self.metadata = Some(metadata);
+    /// Additional metadata to be added to commit info
+    pub fn with_commit_properties(mut self, commit_properties: CommitProperties) -> Self {
+        self.commit_properties = commit_properties;
+        self
+    }
+
+    /// Set a custom execute handler, for pre and post execution
+    pub fn with_custom_execute_handler(mut self, handler: Arc<dyn CustomExecuteHandler>) -> Self {
+        self.custom_execute_handler = Some(handler);
         self
     }
 
     /// Consume self into CreateBuilder with corresponding add actions, schemas and operation meta
-    async fn into_create_builder(self) -> Result<CreateBuilder, Error> {
+    async fn into_create_builder(mut self) -> Result<(CreateBuilder, Uuid), Error> {
         // Use the specified log store. If a log store is not provided, create a new store from the specified path.
         // Return an error if neither log store nor path is provided
-        let log_store = if let Some(log_store) = self.log_store {
-            log_store
-        } else if let Some(location) = self.location {
-            crate::logstore::logstore_for(
+        self.log_store = if let Some(log_store) = self.log_store {
+            Some(log_store)
+        } else if let Some(location) = self.location.clone() {
+            Some(crate::logstore::logstore_for(
                 ensure_table_uri(location)?,
-                self.storage_options.unwrap_or_default(),
+                self.storage_options.clone().unwrap_or_default(),
                 None, // TODO: allow runtime to be passed into builder
-            )?
+            )?)
         } else {
             return Err(Error::MissingLocation);
         };
 
+        let operation_id = self.get_operation_id();
+        self.pre_execute(operation_id).await?;
+
         // Return an error if the location is already a Delta table location
-        if log_store.is_delta_table_location().await? {
+        if self.log_store().is_delta_table_location().await? {
             return Err(Error::DeltaTableAlready);
         }
         debug!(
             "Converting Parquet table in log store location: {:?}",
-            log_store.root_uri()
+            self.log_store().root_uri()
         );
 
         // Get all the parquet files in the location
-        let object_store = log_store.object_store();
+        let object_store = self.log_store().object_store(None);
         let mut files = Vec::new();
         object_store
             .list(None)
@@ -379,7 +399,7 @@ impl ConvertToDeltaBuilder {
 
             let mut arrow_schema = batch_builder.schema().as_ref().clone();
 
-            // Arrow schema of Parquet files may have conflicting metatdata
+            // Arrow schema of Parquet files may have conflicting metadata
             // Since Arrow schema metadata is not used to generate Delta table schema, we set the metadata field to an empty HashMap
             arrow_schema.metadata = HashMap::new();
             arrow_schemas.push(arrow_schema);
@@ -398,23 +418,20 @@ impl ConvertToDeltaBuilder {
 
         // Generate CreateBuilder with corresponding add actions, schemas and operation meta
         let mut builder = CreateBuilder::new()
-            .with_log_store(log_store)
+            .with_log_store(self.log_store().clone())
             .with_columns(schema_fields.into_iter().cloned())
             .with_partition_columns(partition_columns.into_iter())
             .with_actions(actions)
             .with_save_mode(self.mode)
-            .with_configuration(self.configuration);
+            .with_configuration(self.configuration)
+            .with_commit_properties(self.commit_properties);
         if let Some(name) = self.name {
             builder = builder.with_table_name(name);
         }
         if let Some(comment) = self.comment {
             builder = builder.with_comment(comment);
         }
-        if let Some(metadata) = self.metadata {
-            builder = builder.with_metadata(metadata);
-        }
-
-        Ok(builder)
+        Ok((builder, operation_id))
     }
 }
 
@@ -426,10 +443,18 @@ impl std::future::IntoFuture for ConvertToDeltaBuilder {
         let this = self;
 
         Box::pin(async move {
-            let builder = this
+            let handler = this.custom_execute_handler.clone();
+            let (builder, operation_id) = this
                 .into_create_builder()
                 .await
                 .map_err(DeltaTableError::from)?;
+
+            if let Some(handler) = handler {
+                handler
+                    .post_execute(builder.log_store(), operation_id)
+                    .await?;
+            }
+
             let table = builder.await?;
             Ok(table)
         })
@@ -494,7 +519,7 @@ mod tests {
             .to_str()
             .expect("Failed to convert Path to string slice");
         // Copy all files to a temp directory to perform testing. Skip Delta log
-        copy_files(format!("{}/{}", env!("CARGO_MANIFEST_DIR"), path), temp_dir);
+        copy_files(format!("{}/{path}", env!("CARGO_MANIFEST_DIR")), temp_dir);
         let builder = if from_path {
             ConvertToDeltaBuilder::new().with_location(
                 ensure_table_uri(temp_dir).expect("Failed to turn temp dir into a URL"),
@@ -520,7 +545,7 @@ mod tests {
             .to_str()
             .expect("Failed to convert to string slice");
         // Copy all files to a temp directory to perform testing. Skip Delta log
-        copy_files(format!("{}/{}", env!("CARGO_MANIFEST_DIR"), path), temp_dir);
+        copy_files(format!("{}/{path}", env!("CARGO_MANIFEST_DIR")), temp_dir);
         ConvertToDeltaBuilder::new()
             .with_log_store(log_store(temp_dir))
             .with_partition_schema(partition_schema)
@@ -579,7 +604,19 @@ mod tests {
             })
             .collect::<Vec<_>>();
         partition_values.sort_by_key(|(k, v)| (k.clone(), v.serialize()));
-        assert_eq!(partition_values, expected_partition_values);
+
+        for (position, expected) in expected_partition_values.iter().enumerate() {
+            let (key, value) = expected;
+            let (found_key, found_value) = partition_values[position].clone();
+            assert_eq!(key, &found_key);
+
+            match (value, found_value) {
+                // no-op the null comparison due to a breaking change in delta-kernel-rs 0.7.0
+                // which changes null comparables
+                (Scalar::Null(_), Scalar::Null(_)) => {}
+                (v, fv) => assert_eq!(v, &fv),
+            }
+        }
     }
 
     // Test Parquet files in object store location

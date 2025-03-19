@@ -7,10 +7,10 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::mem::take;
 use std::str::FromStr;
+use std::sync::LazyLock;
 
 use arrow_schema::ArrowError;
 use futures::StreamExt;
-use lazy_static::lazy_static;
 use object_store::{path::Path, Error as ObjectStoreError, ObjectStore};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -63,7 +63,7 @@ pub enum ProtocolError {
         source: parquet::errors::ParquetError,
     },
 
-    /// Faild to serialize operation
+    /// Failed to serialize operation
     #[error("Failed to serialize operation: {source}")]
     SerializeOperation {
         #[from]
@@ -243,7 +243,7 @@ impl Eq for Add {}
 
 impl Add {
     /// Get whatever stats are available. Uses (parquet struct) parsed_stats if present falling back to json stats.
-    pub(crate) fn get_stats(&self) -> Result<Option<Stats>, serde_json::error::Error> {
+    pub fn get_stats(&self) -> Result<Option<Stats>, serde_json::error::Error> {
         match self.get_stats_parsed() {
             Ok(Some(stats)) => Ok(Some(stats)),
             Ok(None) => self.get_json_stats(),
@@ -450,6 +450,12 @@ pub enum DeltaOperation {
         /// The status of the operation
         status: String,
     },
+    /// Set table field metadata operations
+    #[serde(rename_all = "camelCase")]
+    UpdateFieldMetadata {
+        /// Fields added to existing schema
+        fields: Vec<StructField>,
+    },
 }
 
 impl DeltaOperation {
@@ -477,6 +483,7 @@ impl DeltaOperation {
             DeltaOperation::AddConstraint { .. } => "ADD CONSTRAINT",
             DeltaOperation::DropConstraint { .. } => "DROP CONSTRAINT",
             DeltaOperation::AddFeature { .. } => "ADD FEATURE",
+            DeltaOperation::UpdateFieldMetadata { .. } => "UPDATE FIELD METADATA",
         }
     }
 
@@ -513,6 +520,7 @@ impl DeltaOperation {
     pub fn changes_data(&self) -> bool {
         match self {
             Self::Optimize { .. }
+            | Self::UpdateFieldMetadata { .. }
             | Self::SetTableProperties { .. }
             | Self::AddColumn { .. }
             | Self::AddFeature { .. }
@@ -585,10 +593,7 @@ impl FromStr for SaveMode {
             "overwrite" => Ok(SaveMode::Overwrite),
             "error" => Ok(SaveMode::ErrorIfExists),
             "ignore" => Ok(SaveMode::Ignore),
-            _ => Err(DeltaTableError::Generic(format!(
-                "Invalid save mode provided: {}, only these are supported: ['append', 'overwrite', 'error', 'ignore']",
-                s
-            ))),
+            _ => Err(DeltaTableError::Generic(format!("Invalid save mode provided: {s}, only these are supported: ['append', 'overwrite', 'error', 'ignore']"))),
         }
     }
 }
@@ -609,7 +614,11 @@ pub(crate) async fn get_last_checkpoint(
 ) -> Result<CheckPoint, ProtocolError> {
     let last_checkpoint_path = Path::from_iter(["_delta_log", "_last_checkpoint"]);
     debug!("loading checkpoint from {last_checkpoint_path}");
-    match log_store.object_store().get(&last_checkpoint_path).await {
+    match log_store
+        .object_store(None)
+        .get(&last_checkpoint_path)
+        .await
+    {
         Ok(data) => Ok(serde_json::from_slice(&data.bytes().await?)?),
         Err(ObjectStoreError::NotFound { .. }) => {
             match find_latest_check_point_for_version(log_store, i64::MAX).await {
@@ -625,15 +634,14 @@ pub(crate) async fn find_latest_check_point_for_version(
     log_store: &dyn LogStore,
     version: i64,
 ) -> Result<Option<CheckPoint>, ProtocolError> {
-    lazy_static! {
-        static ref CHECKPOINT_REGEX: Regex =
-            Regex::new(r"^_delta_log/(\d{20})\.checkpoint\.parquet$").unwrap();
-        static ref CHECKPOINT_PARTS_REGEX: Regex =
-            Regex::new(r"^_delta_log/(\d{20})\.checkpoint\.\d{10}\.(\d{10})\.parquet$").unwrap();
-    }
+    static CHECKPOINT_REGEX: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^_delta_log/(\d{20})\.checkpoint\.parquet$").unwrap());
+    static CHECKPOINT_PARTS_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^_delta_log/(\d{20})\.checkpoint\.\d{10}\.(\d{10})\.parquet$").unwrap()
+    });
 
     let mut cp: Option<CheckPoint> = None;
-    let object_store = log_store.object_store();
+    let object_store = log_store.object_store(None);
     let mut stream = object_store.list(Some(log_store.log_path()));
 
     while let Some(obj_meta) = stream.next().await {
@@ -815,7 +823,7 @@ mod tests {
         let info = serde_json::from_str::<CommitInfo>(raw);
         assert!(info.is_ok());
 
-        // assert that commit info has no required filelds
+        // assert that commit info has no required fields
         let raw = "{}";
         let info = serde_json::from_str::<CommitInfo>(raw);
         assert!(info.is_ok());
@@ -864,6 +872,7 @@ mod tests {
         use arrow::datatypes::{DataType, Date32Type, Field, Fields, TimestampMicrosecondType};
         use arrow::record_batch::RecordBatch;
         use std::sync::Arc;
+
         fn sort_batch_by(batch: &RecordBatch, column: &str) -> arrow::error::Result<RecordBatch> {
             let sort_column = batch.column(batch.schema().column_with_name(column).unwrap().0);
             let sort_indices = sort_to_indices(sort_column, None, None)?;
@@ -881,26 +890,26 @@ mod tests {
                 .collect::<arrow::error::Result<_>>()?;
             RecordBatch::try_from_iter(sorted_columns)
         }
+
         #[tokio::test]
         async fn test_with_partitions() {
             // test table with partitions
             let path = "../test/tests/data/delta-0.8.0-null-partition";
             let table = crate::open_table(path).await.unwrap();
             let actions = table.snapshot().unwrap().add_actions_table(true).unwrap();
-            let actions = sort_batch_by(&actions, "path").unwrap();
 
             let mut expected_columns: Vec<(&str, ArrayRef)> = vec![
-        ("path", Arc::new(array::StringArray::from(vec![
-            "k=A/part-00000-b1f1dbbb-70bc-4970-893f-9bb772bf246e.c000.snappy.parquet",
-            "k=__HIVE_DEFAULT_PARTITION__/part-00001-8474ac85-360b-4f58-b3ea-23990c71b932.c000.snappy.parquet"
-        ]))),
-        ("size_bytes", Arc::new(array::Int64Array::from(vec![460, 460]))),
-        ("modification_time", Arc::new(arrow::array::TimestampMillisecondArray::from(vec![
-            1627990384000, 1627990384000
-        ]))),
-        ("data_change", Arc::new(array::BooleanArray::from(vec![true, true]))),
-        ("partition.k", Arc::new(array::StringArray::from(vec![Some("A"), None]))),
-    ];
+                ("path", Arc::new(array::StringArray::from(vec![
+                    "k=A/part-00000-b1f1dbbb-70bc-4970-893f-9bb772bf246e.c000.snappy.parquet",
+                    "k=__HIVE_DEFAULT_PARTITION__/part-00001-8474ac85-360b-4f58-b3ea-23990c71b932.c000.snappy.parquet"
+                ]))),
+                ("size_bytes", Arc::new(array::Int64Array::from(vec![460, 460]))),
+                ("modification_time", Arc::new(arrow::array::TimestampMillisecondArray::from(vec![
+                    1627990384000, 1627990384000
+                ]))),
+                ("data_change", Arc::new(array::BooleanArray::from(vec![true, true]))),
+                ("partition.k", Arc::new(array::StringArray::from(vec![Some("A"), None]))),
+            ];
             let expected = RecordBatch::try_from_iter(expected_columns.clone()).unwrap();
 
             assert_eq!(expected, actions);
@@ -920,6 +929,7 @@ mod tests {
 
             assert_eq!(expected, actions);
         }
+
         #[tokio::test]
         async fn test_with_deletion_vector() {
             // test table with partitions

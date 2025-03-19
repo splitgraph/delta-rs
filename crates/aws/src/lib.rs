@@ -1,6 +1,6 @@
 //! AWS S3 and similar tooling for delta-rs
 //!
-//! This module also contains the [S3DynamoDbLogStore] implemtnation for concurrent writer support
+//! This module also contains the [S3DynamoDbLogStore] implementation for concurrent writer support
 //! with AWS S3 specifically.
 
 pub mod constants;
@@ -10,7 +10,9 @@ pub mod logstore;
 #[cfg(feature = "native-tls")]
 mod native;
 pub mod storage;
+use aws_config::Region;
 use aws_config::SdkConfig;
+pub use aws_credential_types::provider::SharedCredentialsProvider;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::{
     operation::{
@@ -23,27 +25,28 @@ use aws_sdk_dynamodb::{
     },
     Client,
 };
-use lazy_static::lazy_static;
-use object_store::aws::AmazonS3ConfigKey;
+use deltalake_core::logstore::{default_logstore, logstores, LogStore, LogStoreFactory};
+use deltalake_core::storage::object_store::aws::AmazonS3ConfigKey;
+use deltalake_core::storage::{factories, url_prefix_handler, ObjectStoreRef, StorageOptions};
+use deltalake_core::{DeltaResult, Path};
+use errors::{DynamoDbConfigError, LockClientError};
 use regex::Regex;
 use std::{
     collections::HashMap,
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     time::{Duration, SystemTime},
 };
-use tracing::debug;
-
-use deltalake_core::logstore::{default_logstore, logstores, LogStore, LogStoreFactory};
-use deltalake_core::storage::{factories, url_prefix_handler, ObjectStoreRef, StorageOptions};
-use deltalake_core::{DeltaResult, Path};
-use url::Url;
-
-use errors::{DynamoDbConfigError, LockClientError};
+use storage::S3StorageOptionsConversion;
 use storage::{S3ObjectStoreFactory, S3StorageOptions};
+use tracing::debug;
+use tracing::warn;
+use url::Url;
 
 #[derive(Clone, Debug, Default)]
 pub struct S3LogStoreFactory {}
+
+impl S3StorageOptionsConversion for S3LogStoreFactory {}
 
 impl LogStoreFactory for S3LogStoreFactory {
     fn with_options(
@@ -53,45 +56,31 @@ impl LogStoreFactory for S3LogStoreFactory {
         options: &StorageOptions,
     ) -> DeltaResult<Arc<dyn LogStore>> {
         let store = url_prefix_handler(store, Path::parse(location.path())?);
-
-        // With conditional put in S3-like API we can use the deltalake default logstore which use PutIfAbsent
+        let options = self.with_env_s3(options);
         if options.0.keys().any(|key| {
             let key = key.to_ascii_lowercase();
-            vec![
-                AmazonS3ConfigKey::ConditionalPut.as_ref(),
-                "conditional_put",
-            ]
-            .contains(&key.as_str())
-        }) {
-            debug!("S3LogStoreFactory has been asked to create a default LogStore where the underlying store has Conditonal Put enabled - no locking provider required");
-            return Ok(default_logstore(store, location, options));
-        }
-
-        if options.0.keys().any(|key| {
-            let key = key.to_ascii_lowercase();
-            vec![
+            [
                 AmazonS3ConfigKey::CopyIfNotExists.as_ref(),
                 "copy_if_not_exists",
             ]
             .contains(&key.as_str())
         }) {
             debug!("S3LogStoreFactory has been asked to create a LogStore where the underlying store has copy-if-not-exists enabled - no locking provider required");
-            return Ok(logstore::default_s3_logstore(store, location, options));
+            warn!("Most S3 object store support conditional put, remove copy_if_not_exists parameter to use a more performant conditional put.");
+            return Ok(logstore::default_s3_logstore(store, location, &options));
         }
 
         let s3_options = S3StorageOptions::from_map(&options.0)?;
-
-        if s3_options.locking_provider.as_deref() != Some("dynamodb") {
-            debug!("S3LogStoreFactory has been asked to create a LogStore without the dynamodb locking provider");
-            return Ok(logstore::default_s3_logstore(store, location, options));
+        if s3_options.locking_provider.as_deref() == Some("dynamodb") {
+            debug!("S3LogStoreFactory has been asked to create a LogStore with the dynamodb locking provider");
+            return Ok(Arc::new(logstore::S3DynamoDbLogStore::try_new(
+                location.clone(),
+                options.clone(),
+                &s3_options,
+                store,
+            )?));
         }
-
-        Ok(Arc::new(logstore::S3DynamoDbLogStore::try_new(
-            location.clone(),
-            options.clone(),
-            &s3_options,
-            store,
-        )?))
+        Ok(default_logstore(store, location, &options))
     }
 }
 
@@ -100,7 +89,7 @@ pub fn register_handlers(_additional_prefixes: Option<Url>) {
     let object_stores = Arc::new(S3ObjectStoreFactory::default());
     let log_stores = Arc::new(S3LogStoreFactory::default());
     for scheme in ["s3", "s3a"].iter() {
-        let url = Url::parse(&format!("{}://", scheme)).unwrap();
+        let url = Url::parse(&format!("{scheme}://")).unwrap();
         factories().insert(url.clone(), object_stores.clone());
         logstores().insert(url.clone(), log_stores.clone());
     }
@@ -154,15 +143,26 @@ impl std::fmt::Debug for DynamoDbLockClient {
 
 impl DynamoDbLockClient {
     /// Creates a new DynamoDbLockClient from the supplied storage options.
+    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         sdk_config: &SdkConfig,
         lock_table_name: Option<String>,
         billing_mode: Option<String>,
         max_elapsed_request_time: Option<String>,
         dynamodb_override_endpoint: Option<String>,
+        dynamodb_override_region: Option<String>,
+        dynamodb_override_access_key_id: Option<String>,
+        dynamodb_override_secret_access_key: Option<String>,
+        dynamodb_override_session_token: Option<String>,
     ) -> Result<Self, DynamoDbConfigError> {
-        let dynamodb_sdk_config =
-            Self::create_dynamodb_sdk_config(sdk_config, dynamodb_override_endpoint);
+        let dynamodb_sdk_config = Self::create_dynamodb_sdk_config(
+            sdk_config,
+            dynamodb_override_endpoint,
+            dynamodb_override_region,
+            dynamodb_override_access_key_id,
+            dynamodb_override_secret_access_key,
+            dynamodb_override_session_token,
+        );
 
         let dynamodb_client = aws_sdk_dynamodb::Client::new(&dynamodb_sdk_config);
 
@@ -202,20 +202,45 @@ impl DynamoDbLockClient {
     fn create_dynamodb_sdk_config(
         sdk_config: &SdkConfig,
         dynamodb_override_endpoint: Option<String>,
+        dynamodb_override_region: Option<String>,
+        dynamodb_override_access_key_id: Option<String>,
+        dynamodb_override_secret_access_key: Option<String>,
+        dynamodb_override_session_token: Option<String>,
     ) -> SdkConfig {
         /*
         if dynamodb_override_endpoint exists/AWS_ENDPOINT_URL_DYNAMODB is specified by user
-        use dynamodb_override_endpoint to create dynamodb client
+        override the endpoint in the sdk_config
+        if dynamodb_override_region exists/AWS_REGION_DYNAMODB is specified by user
+        override the region in the sdk_config
+        if dynamodb_override_access_key_id exists/AWS_ACCESS_KEY_ID_DYNAMODB is specified by user
+        override the access_key_id in the sdk_config
+        if dynamodb_override_secret_access_key exists/AWS_SECRET_ACCESS_KEY_DYNAMODB is specified by user
+        override the secret_access_key in the sdk_config
         */
 
-        match dynamodb_override_endpoint {
-            Some(dynamodb_endpoint_url) => sdk_config
-                .to_owned()
-                .to_builder()
-                .endpoint_url(dynamodb_endpoint_url)
-                .build(),
-            None => sdk_config.to_owned(),
+        let mut config_builder = sdk_config.to_owned().to_builder();
+
+        if let Some(dynamodb_endpoint_url) = dynamodb_override_endpoint {
+            config_builder = config_builder.endpoint_url(dynamodb_endpoint_url);
         }
+
+        if let Some(dynamodb_region) = dynamodb_override_region {
+            config_builder = config_builder.region(Region::new(dynamodb_region));
+        }
+
+        if let (Some(access_key_id), Some(secret_access_key)) = (
+            dynamodb_override_access_key_id,
+            dynamodb_override_secret_access_key,
+        ) {
+            config_builder = config_builder.credentials_provider(SharedCredentialsProvider::new(
+                aws_credential_types::Credentials::from_keys(
+                    access_key_id,
+                    secret_access_key,
+                    dynamodb_override_session_token,
+                ),
+            ));
+        }
+        config_builder.build()
     }
 
     /// Create the lock table where DynamoDb stores the commit information for all delta tables.
@@ -223,7 +248,7 @@ impl DynamoDbLockClient {
     /// Transparently handles the case where that table already exists, so it's safe to call.
     /// After `create_table` operation is executed, the table state in DynamoDb is `creating`, and
     /// it's not immediately useable. This method does not wait for the table state to become
-    /// `active`, so transient failures might occurr when immediately using the lock client.
+    /// `active`, so transient failures might occur when immediately using the lock client.
     pub async fn try_create_lock_table(&self) -> Result<CreateLockTableResult, LockClientError> {
         let attribute_definitions = vec![
             AttributeDefinition::builder()
@@ -285,7 +310,7 @@ impl DynamoDbLockClient {
     fn get_primary_key(&self, version: i64, table_path: &str) -> HashMap<String, AttributeValue> {
         maplit::hashmap! {
             constants::ATTR_TABLE_PATH.to_owned()  => string_attr(table_path),
-            constants::ATTR_FILE_NAME.to_owned()   => string_attr(format!("{:020}.json", version)),
+            constants::ATTR_FILE_NAME.to_owned()   => string_attr(format!("{version:020}.json")),
         }
     }
 
@@ -306,9 +331,11 @@ impl DynamoDbLockClient {
                         .send()
                         .await
                 },
-                |err| match err.as_service_error() {
-                    Some(GetItemError::ProvisionedThroughputExceededException(_)) => true,
-                    _ => false,
+                |err| {
+                    matches!(
+                        err.as_service_error(),
+                        Some(GetItemError::ProvisionedThroughputExceededException(_))
+                    )
                 },
             )
             .await
@@ -340,9 +367,11 @@ impl DynamoDbLockClient {
                     .await?;
                 Ok(())
             },
-            |err: &SdkError<_, _>| match err.as_service_error() {
-                Some(PutItemError::ProvisionedThroughputExceededException(_)) => true,
-                _ => false,
+            |err: &SdkError<_, _>| {
+                matches!(
+                    err.as_service_error(),
+                    Some(PutItemError::ProvisionedThroughputExceededException(_))
+                )
             },
         )
         .await
@@ -395,9 +424,11 @@ impl DynamoDbLockClient {
                         .send()
                         .await
                 },
-                |err: &SdkError<_, _>| match err.as_service_error() {
-                    Some(QueryError::ProvisionedThroughputExceededException(_)) => true,
-                    _ => false,
+                |err: &SdkError<_, _>| {
+                    matches!(
+                        err.as_service_error(),
+                        Some(QueryError::ProvisionedThroughputExceededException(_))
+                    )
                 },
             )
             .await
@@ -446,9 +477,11 @@ impl DynamoDbLockClient {
                         .await?;
                     Ok(())
                 },
-                |err: &SdkError<_, _>| match err.as_service_error() {
-                    Some(UpdateItemError::ProvisionedThroughputExceededException(_)) => true,
-                    _ => false,
+                |err: &SdkError<_, _>| {
+                    matches!(
+                        err.as_service_error(),
+                        Some(UpdateItemError::ProvisionedThroughputExceededException(_))
+                    )
                 },
             )
             .await;
@@ -488,9 +521,11 @@ impl DynamoDbLockClient {
                     .await?;
                 Ok(())
             },
-            |err: &SdkError<_, _>| match err.as_service_error() {
-                Some(DeleteItemError::ProvisionedThroughputExceededException(_)) => true,
-                _ => false,
+            |err: &SdkError<_, _>| {
+                matches!(
+                    err.as_service_error(),
+                    Some(DeleteItemError::ProvisionedThroughputExceededException(_))
+                )
             },
         )
         .await
@@ -634,8 +669,7 @@ fn extract_required_string_field<'a>(
         .as_s()
         .map_err(|v| LockClientError::InconsistentData {
             description: format!(
-                "mandatory string field '{field_name}' exists, but is not a string: {:#?}",
-                v,
+                "mandatory string field '{field_name}' exists, but is not a string: {v:#?}",
             ),
         })
         .map(|s| s.as_str())
@@ -667,10 +701,9 @@ fn num_attr<T: ToString>(n: T) -> AttributeValue {
     AttributeValue::N(n.to_string())
 }
 
-lazy_static! {
-    static ref DELTA_LOG_PATH: Path = Path::from("_delta_log");
-    static ref DELTA_LOG_REGEX: Regex = Regex::new(r"(\d{20})\.(json|checkpoint).*$").unwrap();
-}
+static DELTA_LOG_PATH: LazyLock<Path> = LazyLock::new(|| Path::from("_delta_log"));
+static DELTA_LOG_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(\d{20})\.(json|checkpoint).*$").unwrap());
 
 /// Extract version from a file name in the delta log
 fn extract_version_from_filename(name: &str) -> Option<i64> {
@@ -682,7 +715,8 @@ fn extract_version_from_filename(name: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aws_config::Region;
+    use aws_sdk_sts::config::ProvideCredentials;
+
     use object_store::memory::InMemory;
     use serial_test::serial;
 
@@ -725,11 +759,29 @@ mod tests {
         let factory = S3LogStoreFactory::default();
         let store = InMemory::new();
         let url = Url::parse("s3://test-bucket").unwrap();
-        std::env::remove_var(crate::constants::AWS_S3_LOCKING_PROVIDER);
+        unsafe {
+            std::env::remove_var(crate::constants::AWS_S3_LOCKING_PROVIDER);
+        }
         let logstore = factory
             .with_options(Arc::new(store), &url, &StorageOptions::from(HashMap::new()))
             .unwrap();
-        assert_eq!(logstore.name(), "S3LogStore");
+        assert_eq!(logstore.name(), "DefaultLogStore");
+    }
+
+    #[test]
+    #[serial]
+    fn test_logstore_factory_with_locking_provider() {
+        let factory = S3LogStoreFactory::default();
+        let store = InMemory::new();
+        let url = Url::parse("s3://test-bucket").unwrap();
+        unsafe {
+            std::env::set_var(crate::constants::AWS_S3_LOCKING_PROVIDER, "dynamodb");
+        }
+
+        let logstore = factory
+            .with_options(Arc::new(store), &url, &StorageOptions::from(HashMap::new()))
+            .unwrap();
+        assert_eq!(logstore.name(), "S3DynamoDbLogStore");
     }
 
     #[test]
@@ -742,6 +794,10 @@ mod tests {
         let dynamodb_sdk_config = DynamoDbLockClient::create_dynamodb_sdk_config(
             &sdk_config,
             Some("http://localhost:2345".to_string()),
+            None,
+            None,
+            None,
+            None,
         );
         assert_eq!(
             dynamodb_sdk_config.endpoint_url(),
@@ -751,8 +807,66 @@ mod tests {
             dynamodb_sdk_config.region().unwrap().to_string(),
             "eu-west-1".to_string(),
         );
-        let dynamodb_sdk_no_override_config =
-            DynamoDbLockClient::create_dynamodb_sdk_config(&sdk_config, None);
+        let dynamodb_sdk_no_override_config = DynamoDbLockClient::create_dynamodb_sdk_config(
+            &sdk_config,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            dynamodb_sdk_no_override_config.endpoint_url(),
+            Some("http://localhost:1234"),
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_create_dynamodb_sdk_config_override_credentials() {
+        let sdk_config = SdkConfig::builder()
+            .region(Region::from_static("eu-west-1"))
+            .endpoint_url("http://localhost:1234")
+            .build();
+        let dynamodb_sdk_config = DynamoDbLockClient::create_dynamodb_sdk_config(
+            &sdk_config,
+            Some("http://localhost:2345".to_string()),
+            Some("us-west-1".to_string()),
+            Some("access_key_dynamodb".to_string()),
+            Some("secret_access_key_dynamodb".to_string()),
+            None,
+        );
+        assert_eq!(
+            dynamodb_sdk_config.endpoint_url(),
+            Some("http://localhost:2345"),
+        );
+        assert_eq!(
+            dynamodb_sdk_config.region().unwrap().to_string(),
+            "us-west-1".to_string(),
+        );
+
+        // check that access key and secret access key are overridden
+        let credentials_provider = dynamodb_sdk_config
+            .credentials_provider()
+            .unwrap()
+            .provide_credentials()
+            .await
+            .unwrap();
+
+        assert_eq!(credentials_provider.access_key_id(), "access_key_dynamodb");
+        assert_eq!(
+            credentials_provider.secret_access_key(),
+            "secret_access_key_dynamodb"
+        );
+
+        let dynamodb_sdk_no_override_config = DynamoDbLockClient::create_dynamodb_sdk_config(
+            &sdk_config,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(
             dynamodb_sdk_no_override_config.endpoint_url(),
             Some("http://localhost:1234"),

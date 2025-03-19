@@ -7,7 +7,7 @@ use datafusion_expr::{LogicalPlan, UserDefinedLogicalNodeCore};
 // Metric Observer is used to update DataFusion metrics from a record batch.
 // See MetricObserverExec for the physical implementation
 
-#[derive(Debug, Hash, Eq, PartialEq)]
+#[derive(Debug, Hash, Eq, PartialEq, PartialOrd)]
 pub(crate) struct MetricObserver {
     // id is preserved during conversion to physical node
     pub id: String,
@@ -47,7 +47,7 @@ impl UserDefinedLogicalNodeCore for MetricObserver {
     }
 
     fn fmt_for_explain(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "MetricObserver id={}", &self.id)
+        write!(f, "MetricObserver id={}", self.id)
     }
 
     fn from_template(

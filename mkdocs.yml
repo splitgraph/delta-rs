@@ -60,6 +60,7 @@ nav:
       - Reading Change Data: usage/read-cdf.md
       - Examining a table: usage/examining-table.md
       - Querying a table: usage/querying-delta-tables.md
+      - Merging a table: usage/merging-tables.md
       - Managing a table: usage/managing-tables.md
       - Writing a table:
           - usage/writing/index.md
@@ -78,7 +79,8 @@ nav:
           - api/delta_table/delta_table_alterer.md
       - api/schema.md
       - api/storage.md
-      - api/catalog.md
+      - api/query.md
+      - api/transaction.md
       - api/exceptions.md
   - Integrations:
       - Object Storage:
@@ -87,6 +89,8 @@ nav:
           - integrations/object-storage/hdfs.md
           - integrations/object-storage/s3.md
           - integrations/object-storage/s3-like.md
+          - integrations/object-storage/lakefs.md
+          - integrations/object-storage/special_configuration.md
       - Arrow: integrations/delta-lake-arrow.md
       - Daft: integrations/delta-lake-daft.md
       - Dagster: integrations/delta-lake-dagster.md

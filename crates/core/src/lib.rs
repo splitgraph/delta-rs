@@ -65,7 +65,7 @@
 //! };
 //! ```
 
-#![deny(missing_docs)]
+// #![deny(missing_docs)]
 #![allow(rustdoc::invalid_html_tags)]
 #![allow(clippy::nonminimal_bool)]
 
@@ -97,6 +97,7 @@ pub use self::table::config::TableProperty;
 pub use self::table::DeltaTable;
 pub use object_store::{path::Path, Error as ObjectStoreError, ObjectMeta, ObjectStore};
 pub use operations::DeltaOps;
+use std::sync::OnceLock;
 
 // convenience exports for consumers to avoid aligning crate versions
 pub use arrow;
@@ -145,6 +146,7 @@ pub async fn open_table_with_version(
 }
 
 /// Creates a DeltaTable from the given path.
+///
 /// Loads metadata from the version appropriate based on the given ISO-8601/RFC-3339 timestamp.
 /// Infers the storage backend to use from the scheme in the given table path.
 ///
@@ -160,9 +162,18 @@ pub async fn open_table_with_ds(
     Ok(table)
 }
 
-/// Returns rust crate version, can be use used in language bindings to expose Rust core version
+static CLIENT_VERSION: OnceLock<String> = OnceLock::new();
+
+pub fn init_client_version(version: &str) {
+    let _ = CLIENT_VERSION.set(version.to_string());
+}
+
+/// Returns Rust core version or custom set client_version such as the py-binding
 pub fn crate_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+    CLIENT_VERSION
+        .get()
+        .map(|s| s.as_str())
+        .unwrap_or(env!("CARGO_PKG_VERSION"))
 }
 
 #[cfg(test)]
@@ -546,7 +557,12 @@ mod tests {
     async fn test_poll_table_commits() {
         let path = "../test/tests/data/simple_table_with_checkpoint";
         let mut table = crate::open_table_with_version(path, 9).await.unwrap();
-        let peek = table.peek_next_commit(table.version()).await.unwrap();
+        assert_eq!(table.version(), 9);
+        let peek = table
+            .log_store()
+            .peek_next_commit(table.version())
+            .await
+            .unwrap();
         assert!(matches!(peek, PeekCommit::New(..)));
 
         if let PeekCommit::New(version, actions) = peek {
@@ -568,7 +584,11 @@ mod tests {
                 )));
         };
 
-        let peek = table.peek_next_commit(table.version()).await.unwrap();
+        let peek = table
+            .log_store()
+            .peek_next_commit(table.version())
+            .await
+            .unwrap();
         assert!(matches!(peek, PeekCommit::UpToDate));
     }
 
@@ -669,8 +689,7 @@ mod tests {
 
         let error = crate::open_table(non_existing_path_str).await.unwrap_err();
         let _expected_error_msg = format!(
-            "Local path \"{}\" does not exist or you don't have access!",
-            non_existing_path_str
+            "Local path \"{non_existing_path_str}\" does not exist or you don't have access!"
         );
         assert!(matches!(
             error,

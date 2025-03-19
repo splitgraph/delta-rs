@@ -1,4 +1,4 @@
-//! Utilties to extract columns from a record batch or nested / complex arrays.
+//! Utilities to extract columns from a record batch or nested / complex arrays.
 
 use std::sync::Arc;
 
@@ -34,10 +34,8 @@ pub(crate) fn extract_and_cast<'a, T: Array + 'static>(
     arr: &'a dyn ProvidesColumnByName,
     name: &'a str,
 ) -> DeltaResult<&'a T> {
-    extract_and_cast_opt::<T>(arr, name).ok_or(DeltaTableError::Generic(format!(
-        "missing-column: {}",
-        name
-    )))
+    extract_and_cast_opt::<T>(arr, name)
+        .ok_or(DeltaTableError::Generic(format!("missing-column: {name}")))
 }
 
 /// Extracts a column by name and casts it to the given type array type `T`.
@@ -63,14 +61,13 @@ pub(crate) fn extract_column<'a>(
     let child = array
         .column_by_name(path_step)
         .ok_or(ArrowError::SchemaError(format!(
-            "No such field: {}",
-            path_step,
+            "No such field: {path_step}",
         )))?;
 
     if let Some(next_path_step) = remaining_path_steps.next() {
         match child.data_type() {
             DataType::Map(_, _) => {
-                // NOTE a map has exatly one child, but we wnat to be agnostic of its name.
+                // NOTE a map has exactly one child, but we want to be agnostic of its name.
                 // so we case the current array as map, and use the entries accessor.
                 let maparr = cast_column_as::<MapArray>(path_step, &Some(child))?;
                 if let Some(next_path) = remaining_path_steps.next() {
@@ -79,8 +76,7 @@ pub(crate) fn extract_column<'a>(
                     Ok(child)
                     // if maparr.entries().num_columns() != 2 {
                     //     return Err(ArrowError::SchemaError(format!(
-                    //         "Map {} has {} columns, expected 2",
-                    //         path_step,
+                    //         "Map {path_step} has {} columns, expected 2",
                     //         maparr.entries().num_columns()
                     //     )));
                     // }
@@ -119,12 +115,11 @@ fn cast_column_as<'a, T: Array + 'static>(
     column: &Option<&'a Arc<dyn Array>>,
 ) -> Result<&'a T, ArrowError> {
     column
-        .ok_or(ArrowError::SchemaError(format!("No such column: {}", name)))?
+        .ok_or(ArrowError::SchemaError(format!("No such column: {name}")))?
         .as_any()
         .downcast_ref::<T>()
         .ok_or(ArrowError::SchemaError(format!(
-            "{} is not of esxpected type.",
-            name
+            "{name} is not of expected type."
         )))
 }
 

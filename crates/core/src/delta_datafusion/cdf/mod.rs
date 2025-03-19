@@ -1,15 +1,14 @@
 //! Logical operators and physical executions for CDF
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use arrow_schema::{DataType, Field, TimeUnit};
-use lazy_static::lazy_static;
 
-pub(crate) use self::scan::*;
 pub(crate) use self::scan_utils::*;
 use crate::kernel::{Add, AddCDCFile, Remove};
 use crate::DeltaResult;
 
-mod scan;
+pub mod scan;
 mod scan_utils;
 
 /// Change type column name
@@ -19,25 +18,27 @@ pub const COMMIT_VERSION_COL: &str = "_commit_version";
 /// Commit Timestamp column name
 pub const COMMIT_TIMESTAMP_COL: &str = "_commit_timestamp";
 
-lazy_static! {
-    pub(crate) static ref CDC_PARTITION_SCHEMA: Vec<Field> = vec![
+pub(crate) static CDC_PARTITION_SCHEMA: LazyLock<Vec<Field>> = LazyLock::new(|| {
+    vec![
         Field::new(COMMIT_VERSION_COL, DataType::Int64, true),
         Field::new(
             COMMIT_TIMESTAMP_COL,
             DataType::Timestamp(TimeUnit::Millisecond, None),
-            true
-        )
-    ];
-    pub(crate) static ref ADD_PARTITION_SCHEMA: Vec<Field> = vec![
+            true,
+        ),
+    ]
+});
+pub(crate) static ADD_PARTITION_SCHEMA: LazyLock<Vec<Field>> = LazyLock::new(|| {
+    vec![
         Field::new(CHANGE_TYPE_COL, DataType::Utf8, true),
         Field::new(COMMIT_VERSION_COL, DataType::Int64, true),
         Field::new(
             COMMIT_TIMESTAMP_COL,
             DataType::Timestamp(TimeUnit::Millisecond, None),
-            true
+            true,
         ),
-    ];
-}
+    ]
+});
 
 #[derive(Debug)]
 pub(crate) struct CdcDataSpec<F: FileAction> {
