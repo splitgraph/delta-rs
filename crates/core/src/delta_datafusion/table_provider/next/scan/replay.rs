@@ -350,9 +350,9 @@ fn extract_file_statistics(
                     };
 
                     let max_value =
-                        physical_precision(extract_precision(&max_values, f.name()), scan_config);
+                        physical_precision(extract_precision(&max_values, f), scan_config);
                     let min_value =
-                        physical_precision(extract_precision(&min_values, f.name()), scan_config);
+                        physical_precision(extract_precision(&min_values, f), scan_config);
 
                     ColumnStatistics {
                         null_count,
@@ -392,12 +392,39 @@ fn physical_precision(
     }
 }
 
-fn extract_precision(data: &Option<StructData>, name: impl AsRef<str>) -> Precision<ScalarValue> {
-    if let Some(field_index) = data.as_ref().and_then(|v| v.index_of(name.as_ref())) {
+fn extract_precision(data: &Option<StructData>, field: &StructField) -> Precision<ScalarValue> {
+    use delta_kernel::schema::{DataType, PrimitiveType};
+    
+    if let Some(field_index) = data.as_ref().and_then(|v| v.index_of(field.name())) {
         data.as_ref()
-            .map(|v| match to_datafusion_scalar(&v.values()[field_index]) {
-                Ok(df) => Precision::Exact(df),
-                _ => Precision::Absent,
+            .map(|v| {
+                let scalar = &v.values()[field_index];
+                match to_datafusion_scalar(scalar) {
+                    Ok(df) => Precision::Exact(df),
+                    Err(_) => {
+                        // If conversion failed (e.g., decimal with precision=0),
+                        // try to extract precision/scale from field type
+                        if let (Scalar::Decimal(decimal_data), DataType::Primitive(PrimitiveType::Decimal(decimal_type))) 
+                            = (scalar, field.data_type()) 
+                        {
+                            // Use precision/scale from field schema, not from the statistic value
+                            match ScalarValue::Decimal128(
+                                Some(decimal_data.bits()),
+                                decimal_type.precision(),
+                                decimal_type.scale() as i8,
+                            ).validate() {
+                                Ok(()) => Precision::Exact(ScalarValue::Decimal128(
+                                    Some(decimal_data.bits()),
+                                    decimal_type.precision(),
+                                    decimal_type.scale() as i8,
+                                )),
+                                Err(_) => Precision::Absent,
+                            }
+                        } else {
+                            Precision::Absent
+                        }
+                    }
+                }
             })
             .unwrap_or_default()
     } else {
