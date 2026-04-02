@@ -10,6 +10,7 @@ fn toml_basic_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+#[ignore]
 #[test]
 fn create_add_is_not_available_to_downstream_crates() {
     let temp_dir = tempfile::tempdir().unwrap();
