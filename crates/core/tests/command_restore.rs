@@ -4,6 +4,7 @@ use arrow_schema::{DataType as ArrowDataType, Field};
 use chrono::DateTime;
 use deltalake_core::kernel::{DataType, PrimitiveType, StructField};
 use deltalake_core::logstore::commit_uri_from_version;
+use deltalake_core::logstore::object_store::ObjectStoreExt as _;
 use deltalake_core::protocol::SaveMode;
 use deltalake_core::{DeltaTable, ensure_table_uri};
 use futures::TryStreamExt;
@@ -125,7 +126,7 @@ async fn test_restore_by_datetime() -> Result<(), Box<dyn Error>> {
     // The way we obtain a timestamp for a version will have to change when/if we start using CommitInfo for timestamps
     let meta = table
         .object_store()
-        .head(&commit_uri_from_version(version))
+        .head(&commit_uri_from_version(Some(version)))
         .await?;
     let timestamp = meta.last_modified.timestamp_millis();
     let datetime = DateTime::from_timestamp_millis(timestamp).unwrap();

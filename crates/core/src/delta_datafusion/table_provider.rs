@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -38,7 +39,6 @@ use datafusion::{
     prelude::Expr,
     scalar::ScalarValue,
 };
-use delta_kernel::Version;
 use futures::TryStreamExt as _;
 use futures::future::BoxFuture;
 use object_store::ObjectMeta;
@@ -53,7 +53,7 @@ use crate::delta_datafusion::{
     to_correct_scalar_value,
 };
 use crate::kernel::transaction::PROTOCOL;
-use crate::kernel::{Add, EagerSnapshot, Snapshot};
+use crate::kernel::{Add, EagerSnapshot, Snapshot, Version};
 use crate::logstore::LogStore;
 use crate::logstore::LogStoreExt as _;
 use crate::protocol::SaveMode;
@@ -344,7 +344,9 @@ impl<'a> DeltaScanBuilder<'a> {
             // partition filters with Exact pushdown were removed from projection by DF optimizer,
             // we need to add them back for the predicate pruning to work
             if let Some(expr) = &self.filter {
-                for c in expr.column_refs() {
+                // Avoid non-determinism of HashSet (affects the expressions in pushed-down filters)
+                let column_refs = expr.column_refs().into_iter().collect::<BTreeSet<_>>();
+                for c in column_refs {
                     let idx = logical_schema.index_of(c.name.as_str())?;
                     if !used_columns.contains(&idx) {
                         fields.push(logical_schema.field(idx).to_owned());
@@ -400,7 +402,7 @@ impl<'a> DeltaScanBuilder<'a> {
                     let files = self
                         .snapshot
                         .file_views(&self.log_store, None)
-                        .map_ok(|f| f.add_action())
+                        .map_ok(|f| f.to_add())
                         .try_collect::<Vec<_>>()
                         .await?;
                     let files_scanned = files.len();
@@ -425,7 +427,7 @@ impl<'a> DeltaScanBuilder<'a> {
                     let file_actions: Vec<_> = self
                         .snapshot
                         .file_views(&self.log_store, None)
-                        .map_ok(|f| f.add_action())
+                        .map_ok(|f| f.to_add())
                         .try_collect::<Vec<_>>()
                         .await?;
 
@@ -714,18 +716,14 @@ impl TableProviderBuilder {
             None => {
                 if let Some(log_store) = log_store.as_ref() {
                     SnapshotWrapper::Snapshot(
-                        Snapshot::try_new(
-                            log_store,
-                            Default::default(),
-                            table_version.map(|v| v as i64),
-                        )
-                        .await?
-                        .into(),
+                        Snapshot::try_new(log_store, Default::default(), table_version)
+                            .await?
+                            .into(),
                     )
                 } else {
                     return Err(DataFusionError::Plan(
-                    "Either a log store or a snapshot must be provided to build a Delta TableProvider".to_string(),
-                ));
+                        "Either a log store or a snapshot must be provided to build a Delta TableProvider".to_string(),
+                    ));
                 }
             }
         };
@@ -796,7 +794,7 @@ impl DeltaTable {
     pub fn table_provider(&self) -> TableProviderBuilder {
         let mut builder = TableProviderBuilder::new().with_log_store(self.log_store());
         if let Ok(state) = self.snapshot() {
-            builder = builder.with_eager_snapshot(state.snapshot().clone());
+            builder = builder.with_snapshot(state.snapshot().snapshot().clone());
         }
         builder
     }
@@ -1036,7 +1034,7 @@ impl ExecutionPlan for DeltaScan {
         self.parquet_scan.schema()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         self.parquet_scan.properties()
     }
 
@@ -1149,7 +1147,16 @@ pub(crate) fn simplify_expr(
     df_schema: DFSchemaRef,
     expr: Expr,
 ) -> Result<Arc<dyn PhysicalExpr>> {
-    let context = SimplifyContext::new(session.execution_props()).with_schema(df_schema.clone());
+    let execution_props = session.execution_props();
+    let context = SimplifyContext::default()
+        .with_schema(df_schema.clone())
+        .with_query_execution_start_time(execution_props.query_execution_start_time.clone())
+        .with_config_options(
+            execution_props
+                .config_options()
+                .cloned()
+                .unwrap_or_else(|| session.config().options().clone()),
+        );
     let simplifier = ExprSimplifier::new(context).with_max_cycles(10);
     session.create_physical_expr(simplifier.simplify(expr)?, df_schema.as_ref())
 }
@@ -1264,8 +1271,9 @@ fn partitioned_file_from_action(
         },
         partition_values,
         range: None,
-        extensions: None,
         statistics: None,
+        ordering: None,
+        extensions: None,
         metadata_size_hint: None,
     }
 }
@@ -1274,7 +1282,10 @@ fn partitioned_file_from_action(
 mod tests {
     use crate::kernel::{DataType, PrimitiveType, StructField, StructType};
     use crate::operations::create::CreateBuilder;
-    use crate::{DeltaTable, DeltaTableError};
+    use crate::test_utils::object_store::{
+        drain_recorded_object_store_operations as drain_recorded_ops, recording_log_store,
+    };
+    use crate::{DeltaTable, DeltaTableConfig, DeltaTableError};
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -1284,7 +1295,8 @@ mod tests {
     use datafusion::datasource::listing::PartitionedFile;
     use datafusion::execution::context::SessionState;
     use datafusion::logical_expr::dml::InsertOp;
-    use datafusion::physical_plan::collect_partitioned;
+    use datafusion::physical_plan::{collect_partitioned, displayable};
+    use datafusion::prelude::{and, col, lit};
     use object_store::path::Path;
     use std::sync::Arc;
     use url::Url;
@@ -1455,6 +1467,39 @@ mod tests {
             .unwrap();
         let expected = vec!["+----+", "| id |", "+----+", "| 11 |", "| 13 |", "+----+"];
         datafusion::assert_batches_sorted_eq!(&expected, &batches);
+    }
+
+    #[tokio::test]
+    async fn test_table_provider_from_loaded_table_reuses_seeded_snapshot_state() {
+        let base = crate::test_utils::TestTables::Simple
+            .table_builder()
+            .unwrap()
+            .build_storage()
+            .unwrap();
+        let (log_store, mut operations) = recording_log_store(base);
+
+        let mut table = DeltaTable::new(log_store.clone(), DeltaTableConfig::default());
+        table.load().await.unwrap();
+
+        drain_recorded_ops(&mut operations).await;
+
+        let provider = table.table_provider().await.unwrap();
+
+        let session = Arc::new(crate::delta_datafusion::create_session().into_inner());
+        let state = session.state_ref().read().clone();
+        let read_plan = provider.scan(&state, None, &[], None).await.unwrap();
+        let _read_batches: Vec<_> = collect_partitioned(read_plan, session.task_ctx())
+            .await
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect();
+
+        let replay_ops = drain_recorded_ops(&mut operations).await;
+        assert!(
+            replay_ops.iter().all(|op| !op.is_log_replay_read()),
+            "expected loaded table provider scan to reuse seeded snapshot state, got {replay_ops:?}",
+        );
     }
 
     #[tokio::test]
@@ -1651,10 +1696,64 @@ mod tests {
             },
             partition_values: [ScalarValue::Int64(Some(2015)), ScalarValue::Int64(Some(1))].to_vec(),
             range: None,
-            extensions: None,
             statistics: None,
+            ordering: None,
+            extensions: None,
             metadata_size_hint: None,
         };
         assert_eq!(file.partition_values, ref_file.partition_values)
+    }
+
+    #[tokio::test]
+    async fn test_scan_with_projection_has_stable_schema_for_filters() {
+        let columns = [
+            StructField::new(
+                "v1".to_string(),
+                DataType::Primitive(PrimitiveType::Long),
+                true,
+            ),
+            StructField::new(
+                "v2".to_string(),
+                DataType::Primitive(PrimitiveType::Long),
+                true,
+            ),
+            StructField::new(
+                "v3".to_string(),
+                DataType::Primitive(PrimitiveType::Long),
+                true,
+            ),
+        ];
+        let table = DeltaTable::new_in_memory()
+            .create()
+            .with_columns(columns)
+            .await
+            .unwrap();
+        let session_state = create_test_session_state();
+
+        let scan_config = DeltaScanConfigBuilder::new()
+            .build(table.snapshot().unwrap().snapshot())
+            .unwrap();
+        let table_provider = DeltaTableProvider::try_new(
+            table.snapshot().unwrap().snapshot().clone(),
+            table.log_store(),
+            scan_config,
+        )
+        .unwrap();
+
+        // The scan only projects the first column. This requires the TableProvider to add the
+        // columns required for the filter to an intermediate schema. This test should assert that
+        // this intermediate schema is created deterministically.
+        let filter = and(col("v2").eq(lit(2)), col("v3").eq(lit(3)));
+        let scan = table_provider
+            .scan(session_state.as_ref(), Some(&vec![0]), &[filter], None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            displayable(scan.as_ref()).indent(false).to_string(),
+            "\
+DeltaScan
+  DataSourceExec: file_groups={1 group: [[]]}, projection=[v1], file_type=parquet, predicate=v2@1 = CAST(2 AS Int64) AND v3@2 = CAST(3 AS Int64), pruning_predicate=v2_null_count@2 != row_count@3 AND v2_min@0 <= 2 AND 2 <= v2_max@1 AND v3_null_count@6 != row_count@3 AND v3_min@4 <= 3 AND 3 <= v3_max@5, required_guarantees=[]\n"
+        )
     }
 }

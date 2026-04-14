@@ -1,6 +1,5 @@
 import multiprocessing
 import os
-import tempfile
 from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -19,6 +18,14 @@ from deltalake.exceptions import DeltaProtocolError
 from deltalake.query import QueryBuilder
 from deltalake.table import ProtocolVersions
 from deltalake.writer import write_deltalake
+
+S3_SIMPLE_TABLE_FILES = [
+    "part-00000-2befed33-c358-4768-a43c-3eda0d2a499d-c000.snappy.parquet",
+    "part-00000-c1777d7d-89d9-4790-b38a-6ee7e24456b1-c000.snappy.parquet",
+    "part-00001-7891c33d-cedc-47c3-88a6-abcfb049d3b4-c000.snappy.parquet",
+    "part-00004-315835fe-fb44-4562-98f6-5e6cfa3ae45d-c000.snappy.parquet",
+    "part-00007-3a0e4727-de0d-41b6-81ef-5223cf40f025-c000.snappy.parquet",
+]
 
 
 @pytest.mark.pyarrow
@@ -771,39 +778,36 @@ class ExcPassThroughThread(Thread):
 @pytest.mark.s3
 @pytest.mark.integration
 @pytest.mark.timeout(timeout=5, method="thread")
-def test_read_multiple_tables_from_s3(s3_localstack):
+def test_read_multiple_tables_from_s3(s3_localstack, s3_localstack_simple_table_uri):
     """Should be able to create multiple cloud storage based DeltaTable instances
     without blocking on async crates/test function calls.
     """
-    for path in ["s3://deltars/simple", "s3://deltars/simple"]:
+    expected_file_uris = [
+        f"{s3_localstack_simple_table_uri}/{path}" for path in S3_SIMPLE_TABLE_FILES
+    ]
+
+    for path in [s3_localstack_simple_table_uri, s3_localstack_simple_table_uri]:
         t = DeltaTable(path)
-        assert t.file_uris() == [
-            "s3://deltars/simple/part-00000-2befed33-c358-4768-a43c-3eda0d2a499d-c000.snappy.parquet",
-            "s3://deltars/simple/part-00000-c1777d7d-89d9-4790-b38a-6ee7e24456b1-c000.snappy.parquet",
-            "s3://deltars/simple/part-00001-7891c33d-cedc-47c3-88a6-abcfb049d3b4-c000.snappy.parquet",
-            "s3://deltars/simple/part-00004-315835fe-fb44-4562-98f6-5e6cfa3ae45d-c000.snappy.parquet",
-            "s3://deltars/simple/part-00007-3a0e4727-de0d-41b6-81ef-5223cf40f025-c000.snappy.parquet",
-        ]
+        assert t.file_uris() == expected_file_uris
 
 
 @pytest.mark.s3
 @pytest.mark.integration
 @pytest.mark.timeout(timeout=10, method="thread")
-def test_read_multiple_tables_from_s3_multi_threaded(s3_localstack):
+def test_read_multiple_tables_from_s3_multi_threaded(
+    s3_localstack, s3_localstack_simple_table_uri
+):
     thread_count = 10
     b = Barrier(thread_count, timeout=5)
+    expected_file_uris = [
+        f"{s3_localstack_simple_table_uri}/{path}" for path in S3_SIMPLE_TABLE_FILES
+    ]
 
     # make sure it works within multiple threads as well
     def read_table():
         b.wait()
-        t = DeltaTable("s3://deltars/simple")
-        assert t.file_uris() == [
-            "s3://deltars/simple/part-00000-2befed33-c358-4768-a43c-3eda0d2a499d-c000.snappy.parquet",
-            "s3://deltars/simple/part-00000-c1777d7d-89d9-4790-b38a-6ee7e24456b1-c000.snappy.parquet",
-            "s3://deltars/simple/part-00001-7891c33d-cedc-47c3-88a6-abcfb049d3b4-c000.snappy.parquet",
-            "s3://deltars/simple/part-00004-315835fe-fb44-4562-98f6-5e6cfa3ae45d-c000.snappy.parquet",
-            "s3://deltars/simple/part-00007-3a0e4727-de0d-41b6-81ef-5223cf40f025-c000.snappy.parquet",
-        ]
+        t = DeltaTable(s3_localstack_simple_table_uri)
+        assert t.file_uris() == expected_file_uris
 
     threads = [ExcPassThroughThread(target=read_table) for _ in range(thread_count)]
     for t in threads:
@@ -1000,10 +1004,10 @@ def test_partitions_filtering_partitioned_table():
 
 
 @pytest.mark.pyarrow
-def test_partitions_date_partitioned_table():
+def test_partitions_date_partitioned_table(tmp_path: Path):
     import pyarrow as pa
 
-    table_path = tempfile.gettempdir() + "/date_partition_table"
+    table_path = tmp_path / "date_partition_table"
     date_partitions = [
         date(2024, 8, 1),
         date(2024, 8, 2),

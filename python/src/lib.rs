@@ -10,7 +10,6 @@ mod tracing_otlp;
 mod utils;
 mod writer;
 
-use arrow::pyarrow::PyArrowType;
 use arrow_schema::{ArrowError, SchemaRef};
 use chrono::{DateTime, Duration, FixedOffset, Utc};
 use datafusion_ffi::table_provider::FFI_TableProvider;
@@ -27,6 +26,7 @@ use deltalake::delta_datafusion::engine::AsObjectStoreUrl;
 use deltalake::delta_datafusion::{
     DeletionVectorSelection, DeltaCdfTableProvider, DeltaScanConfig, DeltaScanNext,
 };
+use pyo3_arrow::PyDataType;
 
 use deltalake::arrow::array::{
     ArrayRef, BooleanBuilder, LargeStringBuilder, ListBuilder, RecordBatchIterator,
@@ -36,7 +36,7 @@ use deltalake::errors::DeltaTableError;
 use deltalake::kernel::scalars::ScalarExt;
 use deltalake::kernel::transaction::{CommitBuilder, CommitProperties, TableReference};
 use deltalake::kernel::{
-    Action, Add, EagerSnapshot, LogicalFileView, MetadataExt as _, StructDataExt as _, Transaction,
+    Action, Add, EagerSnapshot, LogicalFileView, MetadataExt as _, Transaction, Version,
 };
 use deltalake::lakefs::LakeFSCustomExecuteHandler;
 use deltalake::logstore::LogStoreRef;
@@ -123,8 +123,9 @@ struct RawDeltaTableMetaData {
 
 type StringVec = Vec<String>;
 
-const REQUIRED_DATAFUSION_PY_MAJOR: u32 = 52;
+const REQUIRED_DATAFUSION_PY_MAJOR: u32 = 53;
 static FALLBACK_TASK_CTX_PROVIDER: OnceLock<Arc<SessionContext>> = OnceLock::new();
+const MAX_OPTIMIZE_TARGET_SIZE: u64 = i64::MAX as u64;
 
 /// Maximum number of file-level deletion vector entries per Arrow RecordBatch when returning
 /// results from `DeltaTable.deletion_vectors()`.  Each entry is one (filepath, selection_vector)
@@ -143,6 +144,22 @@ fn deletion_vector_schema() -> Arc<arrow::datatypes::Schema> {
             false,
         ),
     ]))
+}
+
+fn parse_optimize_target_size(target_size: u64) -> PyResult<NonZeroU64> {
+    let target_size = NonZeroU64::new(target_size).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "target_file_size must be between 1 and {MAX_OPTIMIZE_TARGET_SIZE}"
+        ))
+    })?;
+
+    if target_size.get() > MAX_OPTIMIZE_TARGET_SIZE {
+        return Err(PyValueError::new_err(format!(
+            "target_file_size must be between 1 and {MAX_OPTIMIZE_TARGET_SIZE}"
+        )));
+    }
+
+    Ok(target_size)
 }
 
 fn build_deletion_vector_batches(
@@ -207,30 +224,15 @@ fn datafusion_task_context_provider_from_session(
     let task_ctx_provider_obj = session
         .getattr("__datafusion_task_context_provider__")?
         .call0()?;
-    let task_ctx_provider = task_ctx_provider_obj.downcast::<PyCapsule>()?;
+    let task_ctx_provider = task_ctx_provider_obj.cast::<PyCapsule>()?;
 
-    let capsule_name = task_ctx_provider.name()?;
-    if capsule_name.is_none() {
-        return Err(PyValueError::new_err(
-            "Expected datafusion_task_context_provider PyCapsule to have name set.",
-        ));
-    }
-    let capsule_name = capsule_name.unwrap().to_str().map_err(|err| {
-        PyValueError::new_err(format!(
-            "Invalid datafusion_task_context_provider capsule name: {err}"
-        ))
-    })?;
-    if capsule_name != "datafusion_task_context_provider" {
-        return Err(PyValueError::new_err(format!(
-            "Expected PyCapsule name datafusion_task_context_provider, got {capsule_name}",
-        )));
-    }
+    let ptr = task_ctx_provider.pointer_checked(Some(c"datafusion_task_context_provider"))?;
 
-    // SAFETY: `task_ctx_provider` is a `PyCapsule` (downcast above) and we verify its
-    // capsule name is exactly `datafusion_task_context_provider` before taking a typed
-    // reference, matching the producer side DataFusion capsule contract.
+    // SAFETY: pointer_checked validated the capsule name and non-null pointer.
+    // The capsule contains an FFI_TaskContextProvider per the producer-side contract.
     let task_ctx_provider = unsafe {
-        task_ctx_provider.reference::<datafusion_ffi::execution::FFI_TaskContextProvider>()
+        ptr.cast::<datafusion_ffi::execution::FFI_TaskContextProvider>()
+            .as_ref()
     };
     Ok(Some(task_ctx_provider.clone()))
 }
@@ -319,7 +321,7 @@ impl RawDeltaTable {
     fn new(
         py: Python,
         table_uri: &str,
-        version: Option<i64>,
+        version: Option<Version>,
         storage_options: Option<HashMap<String, String>>,
         without_files: bool,
         log_buffer_size: Option<usize>,
@@ -386,7 +388,7 @@ impl RawDeltaTable {
         self.with_table(|t| Ok(t.table_url().to_string()))
     }
 
-    pub fn version(&self) -> PyResult<Option<i64>> {
+    pub fn version(&self) -> PyResult<Option<Version>> {
         self.with_table(|t| Ok(t.version()))
     }
 
@@ -414,7 +416,7 @@ impl RawDeltaTable {
             id: metadata.id().to_string(),
             name: metadata.name().map(String::from),
             description: metadata.description().map(String::from),
-            partition_columns: metadata.partition_columns().clone(),
+            partition_columns: metadata.partition_columns().to_vec(),
             created_time: metadata.created_time(),
             configuration: metadata.configuration().clone(),
         })
@@ -455,7 +457,7 @@ impl RawDeltaTable {
     /// Load the internal [RawDeltaTable] with the table state from the specified `version`
     ///
     /// This will acquire the internal lock since it is a mutating operation!
-    pub fn load_version(&self, py: Python, version: i64) -> PyResult<()> {
+    pub fn load_version(&self, py: Python, version: Version) -> PyResult<()> {
         py.detach(|| {
             #[allow(clippy::await_holding_lock)]
             rt().block_on(async {
@@ -473,7 +475,7 @@ impl RawDeltaTable {
     }
 
     /// Retrieve the latest version from the internally loaded table state
-    pub fn get_latest_version(&self, py: Python) -> PyResult<i64> {
+    pub fn get_latest_version(&self, py: Python) -> PyResult<Version> {
         py.detach(|| {
             #[allow(clippy::await_holding_lock)]
             rt().block_on(async {
@@ -634,7 +636,7 @@ impl RawDeltaTable {
         commit_properties: Option<PyCommitProperties>,
         post_commithook_properties: Option<PyPostCommitHookProperties>,
         full: bool,
-        keep_versions: Option<Vec<i64>>,
+        keep_versions: Option<Vec<Version>>,
     ) -> PyResult<Vec<String>> {
         let (table, metrics) = py.detach(|| {
             let table = self._table.lock().map_err(to_rt_err)?.clone();
@@ -729,7 +731,7 @@ impl RawDeltaTable {
         Ok(serde_json::to_string(&metrics).unwrap())
     }
 
-    /// Run the optimize command on the Delta Table: merge small files into a large file by bin-packing.
+    /// Run compact optimize on the Delta Table while preserving partition-local file order.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         partition_filters = None,
@@ -769,9 +771,7 @@ impl RawDeltaTable {
             }
 
             if let Some(target_size) = target_size {
-                let target_size = NonZeroU64::new(target_size).ok_or_else(|| {
-                    PyValueError::new_err("target_file_size must be greater than 0")
-                })?;
+                let target_size = parse_optimize_target_size(target_size)?;
                 cmd = cmd.with_target_size(target_size);
             }
             if let Some(commit_interval) = min_commit_interval {
@@ -849,9 +849,7 @@ impl RawDeltaTable {
             }
 
             if let Some(target_size) = target_size {
-                let target_size = NonZeroU64::new(target_size).ok_or_else(|| {
-                    PyValueError::new_err("target_file_size must be greater than 0")
-                })?;
+                let target_size = parse_optimize_target_size(target_size)?;
                 cmd = cmd.with_target_size(target_size);
             }
             if let Some(commit_interval) = min_commit_interval {
@@ -1047,8 +1045,8 @@ impl RawDeltaTable {
     pub fn load_cdf(
         &self,
         py: Python,
-        starting_version: Option<i64>,
-        ending_version: Option<i64>,
+        starting_version: Option<Version>,
+        ending_version: Option<Version>,
         starting_timestamp: Option<String>,
         ending_timestamp: Option<String>,
         columns: Option<Vec<String>>,
@@ -1227,7 +1225,7 @@ impl RawDeltaTable {
 
     // Run the restore command on the Delta Table: restore table to a given version or datetime
     #[pyo3(signature = (
-        target, *, ignore_missing_files = false, protocol_downgrade_allowed = false, commit_properties=None
+        target, *, ignore_missing_files = false, protocol_downgrade_allowed = false, commit_properties=None, post_commithook_properties=None
     ))]
     pub fn restore(
         &self,
@@ -1235,11 +1233,12 @@ impl RawDeltaTable {
         ignore_missing_files: bool,
         protocol_downgrade_allowed: bool,
         commit_properties: Option<PyCommitProperties>,
+        post_commithook_properties: Option<PyPostCommitHookProperties>,
     ) -> PyResult<String> {
         let table = self._table.lock().map_err(to_rt_err)?.clone();
         let mut cmd = table.restore();
         if let Some(val) = target {
-            if let Ok(version) = val.extract::<i64>() {
+            if let Ok(version) = val.extract::<Version>() {
                 cmd = cmd.with_version_to_restore(version)
             }
             if let Ok(ds) = val.extract::<PyBackedStr>() {
@@ -1254,7 +1253,9 @@ impl RawDeltaTable {
         cmd = cmd.with_ignore_missing_files(ignore_missing_files);
         cmd = cmd.with_protocol_downgrade_allowed(protocol_downgrade_allowed);
 
-        if let Some(commit_properties) = maybe_create_commit_properties(commit_properties, None) {
+        if let Some(commit_properties) =
+            maybe_create_commit_properties(commit_properties, post_commithook_properties)
+        {
             cmd = cmd.with_commit_properties(commit_properties);
         }
 
@@ -1422,6 +1423,24 @@ impl RawDeltaTable {
             .map_err(PythonError::from)?;
 
         let partition_columns: Vec<&str> = partition_columns.into_iter().collect();
+        let partition_column_keys: Vec<(&str, String)> = partition_columns
+            .iter()
+            .map(|col| {
+                let physical_name = schema
+                    .field(col)
+                    .and_then(|field| {
+                        field
+                            .metadata()
+                            .get("delta.columnMapping.physicalName")
+                            .and_then(|value| match value {
+                                MetadataValue::String(name) => Some(name.clone()),
+                                _ => None,
+                            })
+                    })
+                    .unwrap_or_else(|| (*col).to_string());
+                (*col, physical_name)
+            })
+            .collect();
 
         let state = self.cloned_state()?;
         let log_store = self.log_store()?;
@@ -1433,21 +1452,21 @@ impl RawDeltaTable {
                     .await
             })
             .map_err(PythonError::from)?;
-        let _active_partitions: HashSet<Vec<(&str, Option<String>)>> = HashSet::new();
         let active_partitions: HashSet<Vec<(&str, Option<String>)>> = adds
             .iter()
             .flat_map(|add| {
+                #[allow(deprecated)]
+                let partition_values = add.add_action().partition_values;
                 Ok::<_, PythonError>(
-                    partition_columns
+                    partition_column_keys
                         .iter()
-                        .map(|col| {
+                        .map(|(logical_name, physical_name)| {
                             (
-                                *col,
-                                add.partition_values()
-                                    .and_then(|v| {
-                                        v.index_of(col).and_then(|idx| v.value(idx).cloned())
-                                    })
-                                    .map(|v| v.serialize()),
+                                *logical_name,
+                                partition_values
+                                    .get(physical_name.as_str())
+                                    .cloned()
+                                    .flatten(),
                             )
                         })
                         .collect(),
@@ -2435,7 +2454,7 @@ fn filestats_to_expression_next<'py>(
             })?
             .data_type()
             .clone();
-        let column_type = PyArrowType(column_type).into_pyobject(py)?;
+        let column_type = PyDataType::new(column_type).into_pyarrow(py)?;
         pa.call_method1("scalar", (value,))?
             .call_method1("cast", (column_type,))
     };
@@ -2467,15 +2486,15 @@ fn filestats_to_expression_next<'py>(
     // NOTE: null_counts should always return a struct scalar.
     if let Some(Scalar::Struct(data)) = file_info.null_counts() {
         for (field, value) in data.fields().iter().zip(data.values().iter()) {
-            if stats_columns.contains(field.name()) {
-                if let Scalar::Long(val) = value {
-                    if *val == 0 {
-                        expressions.push(py_field.call1((field.name(),))?.call_method0("is_valid"));
-                    } else if Some(*val as usize) == file_info.num_records() {
-                        expressions.push(py_field.call1((field.name(),))?.call_method0("is_null"));
-                    } else {
-                        has_nulls_set.insert(field.name().to_string());
-                    }
+            if stats_columns.contains(field.name())
+                && let Scalar::Long(val) = value
+            {
+                if *val == 0 {
+                    expressions.push(py_field.call1((field.name(),))?.call_method0("is_valid"));
+                } else if Some(*val as usize) == file_info.num_records() {
+                    expressions.push(py_field.call1((field.name(),))?.call_method0("is_null"));
+                } else {
+                    has_nulls_set.insert(field.name().to_string());
                 }
             }
         }
@@ -2632,7 +2651,12 @@ pub struct PyPostCommitHookProperties {
 }
 
 #[derive(Clone)]
-#[pyclass(name = "Transaction", module = "deltalake._internal", get_all)]
+#[pyclass(
+    name = "Transaction",
+    module = "deltalake._internal",
+    get_all,
+    from_py_object
+)]
 pub struct PyTransaction {
     app_id: String,
     version: i64,
@@ -2991,7 +3015,7 @@ fn convert_to_deltalake(
     })
 }
 
-#[pymodule]
+#[pymodule(gil_used = true)]
 // module name need to match project name
 fn _internal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     use crate::error::{CommitFailedError, DeltaError, SchemaMismatchError, TableNotFoundError};

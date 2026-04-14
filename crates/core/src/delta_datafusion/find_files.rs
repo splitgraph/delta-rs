@@ -78,7 +78,7 @@ pub(crate) async fn find_files(
             // Validate the Predicate and determine if it only contains partition columns
             let mut expr_properties = FindFilesExprProperties {
                 partition_only: true,
-                partition_columns: current_metadata.partition_columns().clone(),
+                partition_columns: current_metadata.partition_columns().to_vec(),
                 result: Ok(()),
             };
 
@@ -111,7 +111,7 @@ pub(crate) async fn find_files(
             let result = FindFiles {
                 candidates: snapshot
                     .file_views(&log_store, None)
-                    .map_ok(|f| f.add_action())
+                    .map_ok(|f| f.to_add())
                     .try_collect()
                     .await?,
                 partition_scan: true,
@@ -262,7 +262,7 @@ fn join_batches_with_add_actions(
         matching_files = field::Empty
     )
 )]
-async fn find_files_scan(
+pub(in crate::delta_datafusion) async fn find_files_scan(
     snapshot: &EagerSnapshot,
     log_store: LogStoreRef,
     session: &dyn Session,
@@ -272,7 +272,7 @@ async fn find_files_scan(
     let candidate_map: HashMap<_, _> = snapshot
         .file_views(&log_store, None)
         .map_ok(|f| {
-            let add = f.add_action();
+            let add = f.to_add();
             (add.path.clone(), add)
         })
         .try_collect()
@@ -390,11 +390,7 @@ pub(crate) fn add_actions_partition_mem_table(
 }
 
 async fn scan_memory_table(snapshot: &EagerSnapshot, predicate: &Expr) -> DeltaResult<Vec<Add>> {
-    let actions = snapshot
-        .log_data()
-        .iter()
-        .map(|f| f.add_action())
-        .collect_vec();
+    let actions = snapshot.log_data().iter().map(|f| f.to_add()).collect_vec();
 
     let Some(mem_table) = add_actions_partition_mem_table(snapshot)? else {
         return Ok(vec![]);
@@ -507,7 +503,7 @@ pub(crate) async fn scan_files_where_matches(
     // validate that the expressions contain no illegal variants
     // that are not eligible for file skipping, e.g. volatile functions.
     let mut visitor = FindFilesExprProperties {
-        partition_columns: partition_columns.clone(),
+        partition_columns: partition_columns.to_vec(),
         partition_only: true,
         result: Ok(()),
     };
@@ -532,7 +528,7 @@ pub(crate) async fn scan_files_where_matches(
     // and with the source file path exposed as column.
     let table_source = provider_as_source(
         DeltaScanNext::builder()
-            .with_eager_snapshot(snapshot.clone())
+            .with_snapshot(snapshot.snapshot().clone())
             .with_file_skipping_predicates(skipping_pred.clone())
             .with_file_column(FILE_ID_COLUMN_DEFAULT)
             .await?,
@@ -581,7 +577,7 @@ pub(crate) async fn scan_files_where_matches(
     )?
     .with_missing_file_policy(MissingFilePolicy::Ignore);
     let selected_provider = DeltaScanNext::builder()
-        .with_eager_snapshot(snapshot.clone())
+        .with_snapshot(snapshot.snapshot().clone())
         .with_file_skipping_predicates(skipping_pred)
         .with_file_column(FILE_ID_COLUMN_DEFAULT)
         .build()
